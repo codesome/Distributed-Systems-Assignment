@@ -17,17 +17,15 @@ int RECV_BASE_PORT = 8000;
 
 class process {
 public:
+    int recv_sock, send_sock, listen_port, max_conn;
     int my_id;
-
-    int recv_sock, send_sock, listen_port;
 
     int N;
     mutex vector_mtx;
     int *time_vector;
-    atomic_int total_events, internal_events, msg_events;    
+    atomic_int internal_events, msg_events;    
 
     atomic_bool end;
-    thread *recv_thread;
 
     // for sending
     vector<int> to_send;
@@ -37,9 +35,9 @@ public:
     int *recv_vector;
 
     process(int my_id, int N, vector<int> to_send): 
-    my_id(my_id), N(N), to_send(to_send), end(false), total_events(0), internal_events(0), msg_events(0) {
+    my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0) {
         time_vector = new int[N];
-        recv_vector = new int[N];
+        recv_vector = new int[1+(N<<1)];
         for(int i = 0; i < N; i++) {
             time_vector[i] = 0;
             recv_vector[i] = 0;
@@ -47,7 +45,7 @@ public:
     }
 
     void print_counts() {
-        printf("%d total:%d, internal:%d, msg:%d\n", my_id, total_events.load(), internal_events.load(), msg_events.load());
+        printf("%d internal:%d, msg:%d\n", my_id, internal_events.load(), msg_events.load());
         fflush(stdout);
     }
 
@@ -58,7 +56,7 @@ public:
         }
         s += "]\n";
 
-        printf(s.c_str());
+        printf("%s",s.c_str());
         fflush(stdout);
     }
 
@@ -90,7 +88,7 @@ public:
         fflush(stdout);
 
         timeval option_value;
-        option_value.tv_sec = 1;
+        option_value.tv_sec = 2;
         option_value.tv_usec = 0;
         setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &option_value, sizeof(timeval));
 
@@ -110,8 +108,8 @@ public:
         // accepting a connection
         int client_sockid = accept(recv_sock, (struct sockaddr *) &client, &len);
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            printf("timeout\n");
-            fflush(stdout);
+            // printf("timeout\n");
+            // fflush(stdout);
             return;
         }
         if(client_sockid < 0) {
@@ -119,25 +117,24 @@ public:
             fflush(stdout);
             exit(-1);
         }
-        printf("Client connected\n");
         fflush(stdout);
 
-        size = recv(client_sockid, recv_vector, N*sizeof(int), 0);
-        if(size != N*sizeof(int)) {
+        size = recv(client_sockid, recv_vector, 1+(N<<1)*sizeof(int), 0);
+        close(client_sockid);
+        if(size <= 0) {
             return;
         }
-        close(client_sockid);
 
         vector_mtx.lock();
         
         time_vector[my_id]++;
-        for(int i=0; i<N; i++) {
-            if(recv_vector[i] > time_vector[i]) {
-                time_vector[i] = recv_vector[i];
+        int sz = recv_vector[0];
+        int j = 1;
+        for(int i=0, j=1; i<sz; i++, j+=2) {
+            if(recv_vector[j+1] > time_vector[recv_vector[j]]) {
+                time_vector[recv_vector[j]] = recv_vector[j+1];
             }
         }
-        internal_events++;
-        total_events++;
         
         vector_mtx.unlock();
 
@@ -151,19 +148,12 @@ public:
         usleep(rand()%100000);
         time_vector[my_id]++;
         internal_events++;
-        total_events++;
 
         vector_mtx.unlock();
     };
 
     void send_event() {
-        // send message to next process
-        // signal(SIGPIPE, SIG_IGN);
-        // connect to the next one
         send_sock = socket(AF_INET, SOCK_STREAM, 0);
-        // setsockopt(send_sock, SOL_SOCKET, SO_SIGNOPIPE, NULL, 0);
-
-        // send the vector
 
         curr_send_pointer = (curr_send_pointer+1)%to_send.size();
         int server_port = RECV_BASE_PORT + to_send[curr_send_pointer];
@@ -176,7 +166,6 @@ public:
 
         // connecting to a server
         int server_sockid;
-        printf("Trying %d\n", my_id);
         if((server_sockid=connect(send_sock, (struct sockaddr *) &server, sizeof(server))) < 0) {
             if(errno != EISCONN) {
                 printf("connect error %d %d %d %d\n", my_id, server_port, server_sockid, errno);
@@ -184,20 +173,28 @@ public:
                 return;
             }
         }
-        printf("Connected %d\n", my_id);
-        fflush(stdout);
 
         vector_mtx.lock();
 
+        vector<int> in_send_format;
+        in_send_format.reserve(1+(N<<1));
+        in_send_format.push_back(N);
+        for(int i=0; i<N; i++) {
+            in_send_format.push_back(i);
+            in_send_format.push_back(time_vector[i]);
+        }
+
         time_vector[my_id]++;
-        send(send_sock, time_vector, N*sizeof(int), 0);
-        msg_events++;
-        total_events++;
+        if(send(send_sock, in_send_format.data(), in_send_format.size()*sizeof(int), 0) > 0) {
+            msg_events++;
+        } else {
+            time_vector[my_id]--;
+        }
         
         vector_mtx.unlock();
+
         close(server_sockid);
         close(send_sock);
-
 
     };
 
@@ -206,14 +203,12 @@ public:
 
 int main(int argc, const char* argv[]) {
 
-    // signal(SIGPIPE, SIG_IGN);
-
     RECV_BASE_PORT = atoi(argv[1]);
 
     int N, M;
     float lambda, alpha;
     vector<vector<int>> to_sends;
-    cin >> N >> lambda >> alpha;
+    cin >> N >> lambda >> alpha >> M;
     to_sends.resize(N);
 
     int size, val;
@@ -226,59 +221,54 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    auto thread_function = [](int thread_id, int N, vector<int> to_send, float alpha){
+    auto thread_function = [](int thread_id, int N, int M, vector<int> to_send, float alpha){
 
         process p(thread_id, N, to_send);
 
-        // create sockets
         p.recv_sock = socket(AF_INET, SOCK_STREAM, 0);
         p.listen_port = RECV_BASE_PORT+thread_id;
 
-        // bind recv socket
-        // listen recv socket
         if(p.listen_recv_server() < 0) {
             fflush(stdout);
             exit(-1);
         }
 
-
         // recv thread
         thread recv_thread([alpha](process *p){
             while(!(p->end.load())) {
-                fflush(stdout);
-                // if(p->current_ratio() < alpha)
-                    p->recv_event();
-                // if(!(p->end.load()) /*&& p->current_ratio() < alpha*/) {
-                //     p->dummy_event();
-                // }
-                // p.print_counts();
+                p->recv_event();
                 p->print_vector_clock();
             }
         }, &p);
-
-        // p.dummy_event();
-        // p.send_event();
         
         // send
         printf("Sending\n");
         fflush(stdout);
-        while(!(p.end.load())) {
-            // if(p.current_ratio() >= alpha)
+        while(p.msg_events.load() < M && p.internal_events.load() < (alpha*M)) {
             p.send_event();
-            // p.recv_event();
+            p.dummy_event();
+        }
+
+        while(p.msg_events.load() < M) {
+            p.send_event();
+        }
+
+        while(p.internal_events.load() < (alpha*M)) {
             p.dummy_event();
         }
         
+        p.end_proc();
+
         recv_thread.join();
 
-        printf("Ending %d %d \n", thread_id, p.end.load());
+        printf("Ending %d, msg=%d, internal=%d \n", thread_id, p.msg_events.load(), p.internal_events.load());
         fflush(stdout);
 
     };
 
     vector<thread> processess;
     for(int i=0; i<N; i++) {
-        processess.push_back(thread(thread_function, i, N, to_sends[i], alpha));
+        processess.push_back(thread(thread_function, i, N, M, to_sends[i], alpha));
     }
 
     for(int i=0; i<N; i++) {
@@ -287,5 +277,3 @@ int main(int argc, const char* argv[]) {
 
     return 0;
 }
-
-
