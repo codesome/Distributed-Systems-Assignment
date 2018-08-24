@@ -1,17 +1,10 @@
 all: normal opt
 
-normal: normal.o 
-	g++ --std=c++14 normal.o -o normal.out -lpthread
+normal:
+	g++ --std=c++14 normal.cpp -o normal.out -lpthread
 
-opt: optimization.o
-	g++ --std=c++14 optimization.o -o optimization.out -lpthread
-
-normal.o:
-	g++ --std=c++14 -c normal.cpp -o normal.o -lpthread
-
-optimization.o:
-	g++ --std=c++14 -c optimization.cpp -o optimization.o -lpthread
-
+opt:
+	g++ --std=c++14 optimization.cpp -o optimization.out -lpthread
 
 test:
 	g++ --std=c++14 test.cpp -o test.out -lpthread -g

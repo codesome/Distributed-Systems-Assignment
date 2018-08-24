@@ -3,6 +3,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <random>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -15,6 +16,9 @@ using namespace std;
 
 int RECV_BASE_PORT = 8000;
 
+default_random_engine generator;
+exponential_distribution<double> *distribution;
+
 class process {
 public:
     int recv_sock, send_sock, listen_port, max_conn;
@@ -22,7 +26,7 @@ public:
 
     int N;
     mutex vector_mtx;
-    int *time_vector;
+    int *time_vector, *last_sent, *last_updated;
     atomic_int internal_events, msg_events;    
 
     atomic_bool end;
@@ -34,13 +38,20 @@ public:
     // for receiving
     int *recv_vector;
 
+    int bytes_sent, no_times_sent;
+
     process(int my_id, int N, vector<int> to_send): 
     my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0) {
         time_vector = new int[N];
-        recv_vector = new int[N];
+        last_sent = new int[N];
+        last_updated = new int[N];
+        recv_vector = new int[1+(N<<1)];
+        bytes_sent = 0;
+        no_times_sent = 0;
         for(int i = 0; i < N; i++) {
             time_vector[i] = 0;
-            recv_vector[i] = 0;
+            last_sent[i] = 0;
+            last_updated[i] = 0;
         }
     }
 
@@ -92,6 +103,8 @@ public:
         option_value.tv_usec = 0;
         setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &option_value, sizeof(timeval));
 
+        sleep(3);
+
         return 0;
     }
 
@@ -119,18 +132,20 @@ public:
         }
         fflush(stdout);
 
-        size = recv(client_sockid, recv_vector, N*sizeof(int), 0);
+        size = recv(client_sockid, recv_vector, (1+(N<<1))*sizeof(int), 0);
         close(client_sockid);
-        if(size != N*sizeof(int)) {
+        if(size <= 0) {
             return;
         }
 
         vector_mtx.lock();
         
         time_vector[my_id]++;
-        for(int i=0; i<N; i++) {
-            if(recv_vector[i] > time_vector[i]) {
-                time_vector[i] = recv_vector[i];
+        int sz = recv_vector[0];
+        int j = 1;
+        for(int i=0, j=1; i<sz; i++, j+=2) {
+            if(recv_vector[j+1] > time_vector[recv_vector[j]]) {
+                time_vector[recv_vector[j]] = recv_vector[j+1];
             }
         }
         
@@ -142,8 +157,9 @@ public:
         // just wait for some time with mutex
 
         vector_mtx.lock();
-        
-        usleep(rand()%100000);
+
+        usleep((*distribution)(generator)*100000);
+        // usleep(rand()%100000);
         time_vector[my_id]++;
         internal_events++;
 
@@ -174,8 +190,18 @@ public:
 
         vector_mtx.lock();
 
+        vector<int> in_send_format;
+        in_send_format.reserve(1+(N<<1));
+        in_send_format.push_back(N);
+        for(int i=0; i<N; i++) {
+            in_send_format.push_back(i);
+            in_send_format.push_back(time_vector[i]);
+        }
+
         time_vector[my_id]++;
-        if(send(send_sock, time_vector, N*sizeof(int), 0) > 0) {
+        if(send(send_sock, in_send_format.data(), in_send_format.size()*sizeof(int), 0) > 0) {
+            bytes_sent += in_send_format.size()*sizeof(int);
+            no_times_sent++;
             msg_events++;
         } else {
             time_vector[my_id]--;
@@ -201,6 +227,8 @@ int main(int argc, const char* argv[]) {
     cin >> N >> lambda >> alpha >> M;
     to_sends.resize(N);
 
+	distribution = new exponential_distribution<double>(lambda);
+
     int size, val;
     for(int i=0; i<N; i++) {
         cin >> size;
@@ -211,7 +239,9 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    auto thread_function = [](int thread_id, int N, int M, vector<int> to_send, float alpha){
+    atomic_int bytes_sent(0), no_times_sent(0);
+
+    auto thread_function = [&bytes_sent, &no_times_sent](int thread_id, int N, int M, vector<int> to_send, float alpha){
 
         process p(thread_id, N, to_send);
 
@@ -246,13 +276,17 @@ int main(int argc, const char* argv[]) {
         while(p.internal_events.load() < (alpha*M)) {
             p.dummy_event();
         }
-        
+
+        sleep(3);        
         p.end_proc();
 
         recv_thread.join();
 
         printf("Ending %d, msg=%d, internal=%d \n", thread_id, p.msg_events.load(), p.internal_events.load());
         fflush(stdout);
+
+        bytes_sent += p.bytes_sent;
+        no_times_sent += p.no_times_sent;
 
     };
 
@@ -265,7 +299,7 @@ int main(int argc, const char* argv[]) {
         processess[i].join();
     }
 
+    printf("Bytes:%d, times:%d, Avg:%f\n", bytes_sent.load(), no_times_sent.load(), float(bytes_sent.load())/float(no_times_sent.load()));
+
     return 0;
 }
-
-
