@@ -19,41 +19,52 @@
 #include <signal.h>
 using namespace std;
 
-int RECV_BASE_PORT = 8000;
+// RECV_BASE_PORT + Process_id gives the port for the process to listen.
+int RECV_BASE_PORT;
 
 default_random_engine generator;
-exponential_distribution<double> *distribution;
+exponential_distribution<double> *distribution; // for sleep.
 uniform_int_distribution<int> toss_coin(0,1);
 
+// process represents a single instance of a distributed system.
 class process {
 public:
-    int recv_sock, send_sock, listen_port, max_conn;
+    int N;
     int my_id;
 
-    int N;
+    int recv_sock, send_sock, listen_port, max_conn;
+    
+    // To protect operations on vector clock.
     mutex vector_mtx;
+    // This is the vector clock, LS, LU.
     int *time_vector, *last_sent, *last_updated;
+    
+    // Counts of various events.
     atomic_int internal_events, msg_events, total_events;    
 
+    // This is made 'true' when the process has to end.
     atomic_bool end;
 
-    // for sending
+    // This is the adjacent processess to his process in the graph topology
+    // to which it has to send the messages.
     vector<int> to_send;
     int curr_send_pointer;
 
     // for receiving
     int *recv_vector;
 
-    int bytes_sent, no_times_sent;
+    // count of number of bytes send and number of messages sent.
+    int bytes_sent, no_msg_sent;
 
     process(int my_id, int N, vector<int> to_send): 
     my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0), total_events(0) {
         time_vector = new int[N];
         last_sent = new int[N];
         last_updated = new int[N];
+        // 2+(N<<1) is the maximum number of elements possible in a message.
         recv_vector = new int[2+(N<<1)];
         bytes_sent = 0;
-        no_times_sent = 0;
+        no_msg_sent = 0;
         for(int i = 0; i < N; i++) {
             time_vector[i] = 0;
             last_sent[i] = 0;
@@ -62,6 +73,7 @@ public:
         listen_port = RECV_BASE_PORT + my_id;
     }
 
+    // returns string form of the current vector clock.
     string vector_clock_string() {
         string s = "[";
         for(int i=0; i<N; i++) {
@@ -79,6 +91,7 @@ public:
         close(recv_sock);
     }
 
+    // Start the listen server. NOTE: messages are not accepted here.
     int listen_recv_server() {
         recv_sock = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -226,7 +239,7 @@ public:
             fflush(stdout);
             // recording the bytes sent.
             bytes_sent += in_send_format.size()*sizeof(int);
-            no_times_sent++;
+            no_msg_sent++;
             msg_events++;
             last_sent[to_send[curr_send_pointer]] = time_vector[my_id];
         } else {
@@ -265,9 +278,9 @@ int main(int argc, const char* argv[]) {
     }
 
     // Total bytes sent and number of messages among all processess.
-    atomic_int bytes_sent(0), no_times_sent(0);
+    atomic_int bytes_sent(0), no_msg_sent(0);
 
-    auto thread_function = [&bytes_sent, &no_times_sent](int thread_id, int N, int M, vector<int> to_send, float alpha){
+    auto thread_function = [&bytes_sent, &no_msg_sent](int thread_id, int N, int M, vector<int> to_send, float alpha){
 
         process p(thread_id, N, to_send);
 
@@ -319,7 +332,7 @@ int main(int argc, const char* argv[]) {
         
         // Updating local counts to the global counter.
         bytes_sent += p.bytes_sent;
-        no_times_sent += p.no_times_sent;
+        no_msg_sent += p.no_msg_sent;
     
     };
 
@@ -334,7 +347,7 @@ int main(int argc, const char* argv[]) {
         processess[i].join();
     }
 
-    printf("Bytes:%d, Total msgs:%d, Avg bytes per message:%f, UnOptimized:%lu\n", bytes_sent.load(), no_times_sent.load(), float(bytes_sent.load())/float(no_times_sent.load()),  (2+(N<<1))*sizeof(int));
+    printf("Bytes:%d, Total msgs:%d, Avg bytes per message:%f, UnOptimized:%lu\n", bytes_sent.load(), no_msg_sent.load(), float(bytes_sent.load())/float(no_msg_sent.load()),  (2+(N<<1))*sizeof(int));
 
     return 0;
 }
