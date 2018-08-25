@@ -1,3 +1,7 @@
+/*
+    Author: Ganesh Vernekar (CS15BTECH11018)
+*/
+
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -15,54 +19,58 @@
 #include <signal.h>
 using namespace std;
 
-int RECV_BASE_PORT = 8000;
+// RECV_BASE_PORT + Process_id gives the port for the process to listen.
+int RECV_BASE_PORT;
 
 default_random_engine generator;
-exponential_distribution<double> *distribution;
+exponential_distribution<double> *distribution; // for sleep.
 uniform_int_distribution<int> toss_coin(0,1);
 
+// process represents a single instance of a distributed system.
 class process {
 public:
-    int recv_sock, send_sock, listen_port, max_conn;
     int my_id;
-
     int N;
+    
+    int recv_sock, send_sock, listen_port, max_conn;
+
+    // To protect operations on vector clock.
     mutex vector_mtx;
-    int *time_vector, *last_sent, *last_updated;
+    // This is the vector clock.
+    int *time_vector;
+
+    // Counts of various events.
     atomic_int internal_events, msg_events, total_events;    
 
+    // This is made 'true' when the process has to end.
     atomic_bool end;
 
-    // for sending
+    // This is the adjacent processess to his process in the graph topology
+    // to which it has to send the messages.
     vector<int> to_send;
     int curr_send_pointer;
 
     // for receiving
     int *recv_vector;
 
-    int bytes_sent, no_times_sent;
+    // count of number of bytes send and number of messages sent.
+    int bytes_sent, no_msg_sent;
 
     process(int my_id, int N, vector<int> to_send): 
     my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0), total_events(0) {
         time_vector = new int[N];
-        last_sent = new int[N];
-        last_updated = new int[N];
+        // 2+(N<<1) is the maximum number of elements possible in a message.
         recv_vector = new int[2+(N<<1)];
         bytes_sent = 0;
-        no_times_sent = 0;
+        no_msg_sent = 0;
         for(int i = 0; i < N; i++) {
             time_vector[i] = 0;
-            last_sent[i] = 0;
-            last_updated[i] = 0;
         }
+        listen_port = RECV_BASE_PORT + my_id;
     }
 
-    void print_counts() {
-        printf("%d internal:%d, msg:%d\n", my_id, internal_events.load(), msg_events.load());
-        fflush(stdout);
-    }
-
-    string print_vector_clock() {
+    // returns string form of the current vector clock.
+    string vector_clock_string() {
         string s = "[";
         for(int i=0; i<N; i++) {
             s += to_string(time_vector[i]) + " ";
@@ -74,12 +82,16 @@ public:
     void end_proc() {
         end.store(true);
     }
-    
-    float current_ratio() {
-        return float(internal_events.load())/float(msg_events.load());
+
+    void close_sockets() {
+        close(recv_sock);
     }
 
+    // Start the listen server. NOTE: messages are not accepted here.
     int listen_recv_server() {
+        
+        recv_sock = socket(AF_INET, SOCK_STREAM, 0);
+
         sockaddr_in server;
         bzero((char *) &server, sizeof(server));
         server.sin_family = AF_INET;
@@ -95,34 +107,32 @@ public:
             fflush(stdout);
             return -1;
         }
-        printf("Listening on port %d\n", listen_port);
+        printf("Process%d Listening on port %d\n", my_id, listen_port);
         fflush(stdout);
 
+        // Timeout for accepting messages.
         timeval option_value;
         option_value.tv_sec = 2;
         option_value.tv_usec = 0;
         setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &option_value, sizeof(timeval));
 
+        // Just to make sure that all servers are up.
         sleep(3);
 
         return 0;
     }
 
+    // A single message receive event.
     void recv_event() {
 
-        // accept connection, receive, and update vector
-        // alternatively do blank event
         unsigned int len = sizeof(sockaddr_in);
         sockaddr_in client;
-        char recv_msg[1024];
         int size;
-        string send_msg;
 
         // accepting a connection
         int client_sockid = accept(recv_sock, (struct sockaddr *) &client, &len);
         if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            // printf("timeout\n");
-            // fflush(stdout);
+            // timeout
             return;
         }
         if(client_sockid < 0) {
@@ -130,8 +140,8 @@ public:
             fflush(stdout);
             exit(-1);
         }
-        fflush(stdout);
 
+        // receive message.
         size = recv(client_sockid, recv_vector, (2+(N<<1))*sizeof(int), 0);
         auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         close(client_sockid);
@@ -140,11 +150,13 @@ public:
         }
 
         vector_mtx.lock();
+
+        // Updating the vector clock.
         total_events++;
-        printf("Process%d receives message from process %d in e%d_%d at %ld, vc: %s\n", my_id, recv_vector[0], my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+        printf("Process%d receives message from process %d in e%d_%d at %ld, vc: %s\n", my_id, recv_vector[0], my_id, total_events.load(), timestamp, vector_clock_string().c_str());
         fflush(stdout);
         time_vector[my_id]++;
-        int sz = recv_vector[1];
+        int sz = recv_vector[1]; // Number of processess in message (always N in here).
         for(int i=0, j=2; i<sz; i++, j+=2) {
             if(recv_vector[j+1] > time_vector[recv_vector[j]]) {
                 time_vector[recv_vector[j]] = recv_vector[j+1];
@@ -155,23 +167,24 @@ public:
 
     };
 
-    void dummy_event() {
-        // just wait for some time with mutex
+    // Internal event.
+    void internal_event() {
 
         vector_mtx.lock();
 
         auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-        usleep((*distribution)(generator)*100000);
+        usleep((*distribution)(generator)*300000); // simulation some process.
         time_vector[my_id]++;
         internal_events++;
         total_events++;
 
-        printf("Process%d executes internal event e%d_%d at %ld, vc: %s\n", my_id, my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+        printf("Process%d executes internal event e%d_%d at %ld, vc: %s\n", my_id, my_id, total_events.load(), timestamp, vector_clock_string().c_str());
         fflush(stdout);
 
         vector_mtx.unlock();
     };
 
+    // A single message send event.
     void send_event() {
         send_sock = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -184,7 +197,7 @@ public:
         server.sin_port = htons(server_port);
         server.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-        // connecting to a server
+        // connecting to the server
         int server_sockid;
         if((server_sockid=connect(send_sock, (struct sockaddr *) &server, sizeof(server))) < 0) {
             if(errno != EISCONN) {
@@ -196,6 +209,9 @@ public:
 
         vector_mtx.lock();
 
+        // getting the message ready to send.
+        // [my_process_id, no_of_elements, tuples of (process id, time value)....]
+        // Here no_of_elements are always fixed.
         vector<int> in_send_format;
         in_send_format.reserve(2+(N<<1));
         in_send_format.push_back(my_id);
@@ -209,10 +225,11 @@ public:
         auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         if(send(send_sock, in_send_format.data(), in_send_format.size()*sizeof(int), 0) > 0) {
             total_events++;
-            printf("Process%d sends message to process %d from e%d_%d at %ld, vc: %s\n", my_id, to_send[curr_send_pointer], my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+            printf("Process%d sends message to process %d from e%d_%d at %ld, vc: %s\n", my_id, to_send[curr_send_pointer], my_id, total_events.load(), timestamp, vector_clock_string().c_str());
             fflush(stdout);
+            // recording the bytes sent.
             bytes_sent += in_send_format.size()*sizeof(int);
-            no_times_sent++;
+            no_msg_sent++;
             msg_events++;
         } else {
             time_vector[my_id]--;
@@ -224,8 +241,6 @@ public:
         close(send_sock);
 
     };
-
-
 };
 
 int main(int argc, const char* argv[]) {
@@ -240,6 +255,7 @@ int main(int argc, const char* argv[]) {
 
 	distribution = new exponential_distribution<double>(lambda);
 
+    // input of graph topology.
     int size, val;
     for(int i=0; i<N; i++) {
         cin >> size;
@@ -250,14 +266,12 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    atomic_int bytes_sent(0), no_times_sent(0);
+    // Total bytes sent and number of messages among all processess.s
+    atomic_int bytes_sent(0), no_msg_sent(0);
 
-    auto thread_function = [&bytes_sent, &no_times_sent](int thread_id, int N, int M, vector<int> to_send, float alpha){
+    auto thread_function = [&bytes_sent, &no_msg_sent](int thread_id, int N, int M, vector<int> to_send, float alpha){
 
         process p(thread_id, N, to_send);
-
-        p.recv_sock = socket(AF_INET, SOCK_STREAM, 0);
-        p.listen_port = RECV_BASE_PORT+thread_id;
 
         if(p.listen_recv_server() < 0) {
             fflush(stdout);
@@ -269,50 +283,60 @@ int main(int argc, const char* argv[]) {
             while(!(p->end.load())) {
                 p->recv_event();
             }
+
+            p->close_sockets();
         }, &p);
         
         // send
         printf("Sending\n");
         fflush(stdout);
         while(p.msg_events.load() < M && p.internal_events.load() < (alpha*M)) {
+            // Randomly select message send or internal event.
+            // Do this till we have to perform both the operations.
             if(toss_coin(generator)) {
                 p.send_event();
             } else {
-                p.dummy_event();
+                p.internal_event();
             }
         }
 
         while(p.msg_events.load() < M) {
+            // Remaining message send events.
             p.send_event();
         }
 
         while(p.internal_events.load() < (alpha*M)) {
-            p.dummy_event();
+            // Remaining internal events.
+            p.internal_event();
         }
 
+        // This sleep is just to make sure that all sending messages are complete before we stop receiving.
         sleep(3);        
         p.end_proc();
 
         recv_thread.join();
 
-        printf("Ending %d, msg=%d, internal=%d \n", thread_id, p.msg_events.load(), p.internal_events.load());
+        printf("Ending Process%d, msg=%d, internal=%d \n", thread_id, p.msg_events.load(), p.internal_events.load());
         fflush(stdout);
 
+        // Updating local counts to the global counter.
         bytes_sent += p.bytes_sent;
-        no_times_sent += p.no_times_sent;
+        no_msg_sent += p.no_msg_sent;
 
     };
 
+    // Creating processess.
     vector<thread> processess;
     for(int i=0; i<N; i++) {
         processess.push_back(thread(thread_function, i, N, M, to_sends[i], alpha));
     }
 
+    // Waiting for the processess to end.
     for(int i=0; i<N; i++) {
         processess[i].join();
     }
 
-    printf("Bytes:%d, Total msgs:%d, Avg:%f\n", bytes_sent.load(), no_times_sent.load(), float(bytes_sent.load())/float(no_times_sent.load()));
+    printf("Bytes:%d, Total msgs:%d, Avg bytes per message:%f\n", bytes_sent.load(), no_msg_sent.load(), float(bytes_sent.load())/float(no_msg_sent.load()));
 
     return 0;
 }
