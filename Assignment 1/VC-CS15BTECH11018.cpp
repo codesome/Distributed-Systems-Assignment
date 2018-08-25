@@ -4,6 +4,7 @@
 #include <vector>
 #include <mutex>
 #include <random>
+#include <chrono>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -18,6 +19,7 @@ int RECV_BASE_PORT = 8000;
 
 default_random_engine generator;
 exponential_distribution<double> *distribution;
+uniform_int_distribution<int> toss_coin(0,1);
 
 class process {
 public:
@@ -27,7 +29,7 @@ public:
     int N;
     mutex vector_mtx;
     int *time_vector, *last_sent, *last_updated;
-    atomic_int internal_events, msg_events;    
+    atomic_int internal_events, msg_events, total_events;    
 
     atomic_bool end;
 
@@ -41,11 +43,11 @@ public:
     int bytes_sent, no_times_sent;
 
     process(int my_id, int N, vector<int> to_send): 
-    my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0) {
+    my_id(my_id), N(N), to_send(to_send), end(false), internal_events(0), msg_events(0), total_events(0) {
         time_vector = new int[N];
         last_sent = new int[N];
         last_updated = new int[N];
-        recv_vector = new int[1+(N<<1)];
+        recv_vector = new int[2+(N<<1)];
         bytes_sent = 0;
         no_times_sent = 0;
         for(int i = 0; i < N; i++) {
@@ -60,15 +62,13 @@ public:
         fflush(stdout);
     }
 
-    void print_vector_clock() {
-        string s = to_string(my_id) + " [";
+    string print_vector_clock() {
+        string s = "[";
         for(int i=0; i<N; i++) {
             s += to_string(time_vector[i]) + " ";
         }
-        s += "]\n";
-
-        printf("%s",s.c_str());
-        fflush(stdout);
+        s += "]";
+        return s;
     }
 
     void end_proc() {
@@ -132,18 +132,20 @@ public:
         }
         fflush(stdout);
 
-        size = recv(client_sockid, recv_vector, (1+(N<<1))*sizeof(int), 0);
+        size = recv(client_sockid, recv_vector, (2+(N<<1))*sizeof(int), 0);
+        auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         close(client_sockid);
         if(size <= 0) {
             return;
         }
 
         vector_mtx.lock();
-        
+        total_events++;
+        printf("Process%d receives message from process %d in e%d_%d at %ld, vc: %s\n", my_id, recv_vector[0], my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+        fflush(stdout);
         time_vector[my_id]++;
-        int sz = recv_vector[0];
-        int j = 1;
-        for(int i=0, j=1; i<sz; i++, j+=2) {
+        int sz = recv_vector[1];
+        for(int i=0, j=2; i<sz; i++, j+=2) {
             if(recv_vector[j+1] > time_vector[recv_vector[j]]) {
                 time_vector[recv_vector[j]] = recv_vector[j+1];
             }
@@ -158,10 +160,14 @@ public:
 
         vector_mtx.lock();
 
+        auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         usleep((*distribution)(generator)*100000);
-        // usleep(rand()%100000);
         time_vector[my_id]++;
         internal_events++;
+        total_events++;
+
+        printf("Process%d executes internal event e%d_%d at %ld, vc: %s\n", my_id, my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+        fflush(stdout);
 
         vector_mtx.unlock();
     };
@@ -191,7 +197,8 @@ public:
         vector_mtx.lock();
 
         vector<int> in_send_format;
-        in_send_format.reserve(1+(N<<1));
+        in_send_format.reserve(2+(N<<1));
+        in_send_format.push_back(my_id);
         in_send_format.push_back(N);
         for(int i=0; i<N; i++) {
             in_send_format.push_back(i);
@@ -199,7 +206,11 @@ public:
         }
 
         time_vector[my_id]++;
+        auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         if(send(send_sock, in_send_format.data(), in_send_format.size()*sizeof(int), 0) > 0) {
+            total_events++;
+            printf("Process%d sends message to process %d from e%d_%d at %ld, vc: %s\n", my_id, to_send[curr_send_pointer], my_id, total_events.load(), timestamp, print_vector_clock().c_str());
+            fflush(stdout);
             bytes_sent += in_send_format.size()*sizeof(int);
             no_times_sent++;
             msg_events++;
@@ -257,7 +268,6 @@ int main(int argc, const char* argv[]) {
         thread recv_thread([alpha](process *p){
             while(!(p->end.load())) {
                 p->recv_event();
-                p->print_vector_clock();
             }
         }, &p);
         
@@ -265,8 +275,11 @@ int main(int argc, const char* argv[]) {
         printf("Sending\n");
         fflush(stdout);
         while(p.msg_events.load() < M && p.internal_events.load() < (alpha*M)) {
-            p.send_event();
-            p.dummy_event();
+            if(toss_coin(generator)) {
+                p.send_event();
+            } else {
+                p.dummy_event();
+            }
         }
 
         while(p.msg_events.load() < M) {
@@ -299,7 +312,7 @@ int main(int argc, const char* argv[]) {
         processess[i].join();
     }
 
-    printf("Bytes:%d, times:%d, Avg:%f\n", bytes_sent.load(), no_times_sent.load(), float(bytes_sent.load())/float(no_times_sent.load()));
+    printf("Bytes:%d, Total msgs:%d, Avg:%f\n", bytes_sent.load(), no_times_sent.load(), float(bytes_sent.load())/float(no_times_sent.load()));
 
     return 0;
 }
