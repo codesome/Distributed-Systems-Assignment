@@ -10,6 +10,7 @@
 #include <map>
 #include <random>
 #include <chrono>
+#include <fstream>
 #include <string.h>
 #include <assert.h>
 #include <sys/types.h>
@@ -23,8 +24,7 @@
 #include "channel.hpp"
 using namespace std;
 
-// RECV_BASE_PORT + PROCESS_ID gives the port for the process to listen.
-int RECV_BASE_PORT, PROCESS_ID, MAX_TRANSACTION;
+int PROCESS_ID, MAX_TRANSACTION;
 
 const int max_size = 65536;
 
@@ -108,13 +108,15 @@ struct message {
 
 struct snapshot {
     int pid;
-    int transferred, current;
+    int transferred, current, recv;
     vector<message> msgs;
 
     // 1 int for the number of msgs.
     int marshall_base_size = 4*sizeof(int);
 
     void clear() {
+        transferred = 0;
+        current = 0;
         msgs.clear();
     }
 
@@ -149,6 +151,15 @@ struct snapshot {
     }
 
     void print() {
+        printf("pid=%d, transferred=%d, recv=%d, current=%d, msgs={", pid, transferred, recv, current);
+        for(auto &m: msgs) {
+            printf(" {from=%d,to=%d,color=%d,amount=%d}", m.from, m.to, m.color, m.amount);
+        }
+        printf(" }\n");
+        fflush(stdout);
+    }
+
+    void string() {
         printf("pid=%d, transferred=%d, current=%d, msgs={", pid, transferred, current);
         for(auto &m: msgs) {
             printf(" {from=%d,to=%d,color=%d,amount=%d}", m.from, m.to, m.color, m.amount);
@@ -166,7 +177,7 @@ struct buffer_message {
 };
 
 
-int main() {
+int main2() {
 
     snapshot snap;
     snap.pid = 1;
@@ -204,13 +215,10 @@ int main() {
 class process {
 public:
     int N;
-    int my_id;
-    atomic_int total_amount, total_amount_sent;
+    atomic_int total_amount, total_amount_sent, total_amount_recv;
     COLOR color;
 
     map<int,snapshot*> snapshots;
-
-    int recv_sock, send_sock, listen_port, max_conn;
 
     // This is made 'true' when the process has to end.
     atomic_bool end;
@@ -233,9 +241,10 @@ public:
     // coordinator
     vector<snapshot> all_snapshots;
     vector<int> snapshot_received;
+    ofstream snap_dump;
+    int snap_count;
 
     process(int N, vector<int> to_send, vector<int> to_recv, int to_send_snapshot, vector<int> to_send_terminate, int total_amount): 
-    my_id(my_id), 
     N(N), 
     to_send(to_send), 
     to_recv(to_recv), 
@@ -244,15 +253,17 @@ public:
     total_amount(total_amount), 
     end(false),
     total_amount_sent(0),
-    curr_send_pointer(-1) {
+    total_amount_recv(0),
+    curr_send_pointer(-1),
+    snap_count(0) {
         // TODO: fix this
         // 2+(N<<1) is the maximum number of elements possible in a message.
         recv_vector = malloc(max_size);
         send_vector = malloc(max_size);
-        listen_port = RECV_BASE_PORT + my_id;
         color = WHITE;
         if(root()) {
             snapshot_received.resize(N);
+            snap_dump.open("snapshot_dump.txt");
         }
     }
 
@@ -260,6 +271,8 @@ public:
         if(!end.load()) {
             recv_buffer.close();
             end.store(true);
+            snap_dump << "===============================================================================\n";
+            snap_dump.close();
         }
     }
 
@@ -267,24 +280,22 @@ public:
         return PROCESS_ID == to_send_snapshot;
     }
 
+    void dump_snapshot() {
+        snap_count++;
+        snap_dump << "===============================================================================\n";
+        snap_dump << "SNAPSHOT " << snap_count << endl;
+        int cnt = 0;
+        for(auto &s: all_snapshots) {
+            snap_dump << "{\n\tpid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl;
+            for(auto &m: s.msgs) {
+                snap_dump << "\t\t{from=" << m.from << ",to=" << m.to << ",amount=" << m.amount << "}\n";
+            }
+            snap_dump << "}\n";
+        }
+    }
+
     // A single message receive event.
     void recv_event() {
-
-        unsigned int len = sizeof(sockaddr_in);
-        sockaddr_in client;
-
-        // accepting a connection
-        int client_sockid = accept(recv_sock, (struct sockaddr *) &client, &len);
-        if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            // timeout
-            return;
-        }
-        if(client_sockid < 0) {
-            printf("accept error\n");
-            fflush(stdout);
-            MPI_Abort(MPI_COMM_WORLD, -1);
-        }
-
         // receive message.
         MPI_Status status;
         if(MPI_Recv(recv_vector, max_size, MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status) != 0) {
@@ -327,10 +338,12 @@ public:
         }
         send_mtx.lock();
         color = RED;
+        all_snapshots.clear();
         my_snapshot.clear();
         my_snapshot.pid = PROCESS_ID;
-        my_snapshot.transferred = total_amount_sent;
-        my_snapshot.current = total_amount;
+        my_snapshot.transferred = total_amount_sent.load();
+        my_snapshot.current = total_amount.load();
+        my_snapshot.recv = total_amount_recv.load();
         for(auto p: to_recv) {
             marker_received[p] = false;
         }
@@ -347,10 +360,10 @@ public:
         cpy = write_int(cpy, PROCESS_ID);
         for(auto p: to_send) {
             if(MPI_Send(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD) == 0) {
-                printf("Process %d sent marker to %d\n", PROCESS_ID, p);
+                printf("MARKER: %d -> %d\n", PROCESS_ID, p);
                 fflush(stdout);
             } else {
-                // TODO: handle error
+                printf("### SEND ERROR\n"); fflush(stdout);
             }
         }
         send_mtx.unlock();
@@ -366,25 +379,31 @@ public:
             }
             total_transaction += s.transferred;
         }
-        printf("SNAPSHOT: system_total=%d, total_transaction=%d\n", system_total, total_transaction);
+        dump_snapshot();
+        printf("SNAPSHOT: total_process=%lu, system_total=%d, total_transaction=%d\n", all_snapshots.size(), system_total, total_transaction);
         fflush(stdout);
         if(total_transaction > MAX_TRANSACTION) {
-            send_mtx.lock();
-            // send terminate to all
-            void *cpy = send_vector;
-            cpy = write_char(cpy, CONTROL);
-            cpy = write_char(cpy, TERMINATE);
-            for(auto p: to_send_terminate) {
-                if(MPI_Send(send_vector, 2*sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD) == 0) {
-                    printf("Process %d sent terminate to %d\n", PROCESS_ID, p);
-                    fflush(stdout);
-                } else {
-                    // TODO: handle error
-                }
-            }
-            send_mtx.unlock();
+            printf("### snapshot termination\n");
+            send_termination();
             end_proc();
         }
+    }
+
+    void send_termination() {
+        send_mtx.lock();
+        // send terminate to all
+        void *cpy = send_vector;
+        // cpy = write_char(cpy, CONTROL);
+        cpy = write_char(cpy, TERMINATE);
+        for(auto p: to_send_terminate) {
+            if(MPI_Send(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD) == 0) {
+                printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
+                fflush(stdout);
+            } else {
+                printf("### SEND ERROR\n"); fflush(stdout);
+            }
+        }
+        send_mtx.unlock();
     }
 
     void process_messages() {
@@ -403,6 +422,9 @@ public:
                     message m;
                     m.unmarshall(data);
                     total_amount += m.amount;
+                    total_amount_recv += m.amount;
+                    printf("AMOUNT RECEIVED (%d <- %d): %d\n", PROCESS_ID, m.from, m.amount);
+                    fflush(stdout);
                     if(color == RED && m.color == WHITE) {
                         my_snapshot.msgs.push_back(m);
                     }
@@ -413,22 +435,28 @@ public:
                     int from = read_int(&data);
                     switch(ctype) {
                         case MARKER: {
+                            printf("%d received MARKER from %d\n", PROCESS_ID, from);
+                            fflush(stdout);
                             if(color==WHITE) {
                                 trigger_snapshot();
                             }
                             marker_received[from] = true;
                             if(all_markers_received()) {
-                                printf("Process %d received all markers\n", PROCESS_ID);
+                                send_mtx.lock();
+                                printf("SNAPSHOT DONE: %d\n", PROCESS_ID);
                                 fflush(stdout);
                                 if(root()) {
-                                    all_snapshots.push_back(my_snapshot);
-                                    snapshot_received[PROCESS_ID] = true;
+                                    if(!snapshot_received[PROCESS_ID]) {
+                                        all_snapshots.push_back(my_snapshot);
+                                        snapshot_received[PROCESS_ID] = true;
+                                    }
+                                    color = WHITE;
                                     if(all_snapshots_received()) {
                                         root_termination_check();
                                     }
+                                    send_mtx.unlock();
                                     break;
                                 }
-                                send_mtx.lock();
 
                                 void *cpy = send_vector;
                                 cpy = write_char(cpy, CONTROL);
@@ -436,11 +464,12 @@ public:
                                 cpy = write_int(cpy, PROCESS_ID);
                                 int size = my_snapshot.marshall(cpy) + (2*sizeof(char)) + sizeof(int);
 
+                                my_snapshot.print();
                                 if(MPI_Send(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD) == 0) {
-                                    printf("Process %d successfully captured the snapshot and sent to %d\n", PROCESS_ID, to_send_snapshot);
+                                    printf("SNAPSHOT SENT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
                                     fflush(stdout);
                                 } else {
-                                    // TODO: handle error
+                                    printf("### SEND ERROR\n"); fflush(stdout);
                                 }
 
                                 color = WHITE;
@@ -449,6 +478,8 @@ public:
                             break;
                         } // MARKER
                         case SNAPSHOT: {
+                            printf("Process %d got snapshot from %d\n", PROCESS_ID, from);
+                            fflush(stdout);
                             if(root()) {
                                 snapshot s;
                                 s.unmarshall(data);
@@ -463,27 +494,39 @@ public:
                             }
                             send_mtx.lock();
                             if(MPI_Send(msg.data, msg.size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD) == 0) {
-                                printf("Process %d forwared the snapshot to %d\n", PROCESS_ID, to_send_snapshot);
+                                printf("FORWARD SNAPSHOT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
                                 fflush(stdout);
                             } else {
-                                // TODO: handle error
+                                printf("### SEND ERROR\n"); fflush(stdout);
                             }
                             send_mtx.unlock();
                             break;
                         } // SNAPSHOT
                         default:
                             printf("Unknown control message type (process=%d): %d\n", PROCESS_ID, type);
+                            fflush(stdout);
                     }
                     break;
                 } // CONTROL
                 case TERMINATE: {
+                    printf("TRMINATE: %d\n", PROCESS_ID);
+                    fflush(stdout);
+                    send_termination();
                     end_proc();
                     break;
                 } // TERMINATE
                 default:
                     printf("Unknown message type (process=%d): %d\n", PROCESS_ID, type);
+                    fflush(stdout);
             }
 
+            free(msg.data);
+        }
+        while(!is_closed) {
+            buffer_message msg = recv_buffer.retrieve(&is_closed);
+            if(is_closed) {
+                return;
+            }
             free(msg.data);
         }
     }
@@ -492,7 +535,7 @@ public:
     void internal_event() {
         auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         usleep((*distribution)(generator)*300000); // simulation some process.
-        printf("Process%d executes internal event\n", my_id);
+        printf("Process %d executes internal event\n", PROCESS_ID);
         fflush(stdout);
     };
 
@@ -508,8 +551,9 @@ public:
             send_mtx.unlock();
             return;
         }
-        int max = total < 100? total: 100;
-        int transaction_amount = rand()%max;
+        int max = total < 500? total: 500;
+        uniform_int_distribution<int> random_amount((max/2)+1,max);
+        int transaction_amount = (clock() + random_amount(generator))%max;
         if(transaction_amount == 0) transaction_amount = 1;
         m.amount = transaction_amount;
 
@@ -519,17 +563,19 @@ public:
         if(MPI_Send(send_vector, message_size, MPI_BYTE, send_to, 0, MPI_COMM_WORLD) == 0) {
             total_amount -= transaction_amount;
             total_amount_sent += transaction_amount;
-            printf("Process%d sends %d to process %d\n", my_id, transaction_amount, send_to);
+            printf("Process %d sends %d to process %d\n", PROCESS_ID, transaction_amount, send_to);
             fflush(stdout);
         } else {
-            // TODO: handle error
+            printf("### SEND ERROR\n"); fflush(stdout);
         }
         send_mtx.unlock();
     };
 };
 
-int main2(int argc, const char* argv[]) {
+int main(int argc, const char* argv[]) {
 
+    printf("P1\n");
+    fflush(stdout);
     MPI_Init(NULL, NULL);
     // Find out rank, size
     int world_rank;
@@ -539,13 +585,15 @@ int main2(int argc, const char* argv[]) {
 
     srand(time(NULL));
 
-    RECV_BASE_PORT = atoi(argv[1]);
     PROCESS_ID = world_rank;
+    printf("P2\n");
 
+    ifstream inFile;
+    inFile.open("inp-params.txt");
     int N, A, T;
     float lambda;
     vector<int> to_send, to_recv, to_send_terminate;
-    cin >> N >> A >> T >> lambda;
+    inFile >> N >> A >> T >> lambda;
     if(!(
         (N > 0) &&
         (N == world_size) &&
@@ -565,29 +613,28 @@ int main2(int argc, const char* argv[]) {
     int size, val;
     int to_send_snapshot = 0;
     for(int i=0; i<N; i++) {
-        cin >> size;
+        inFile >> size;
         if(i == PROCESS_ID) {
             for(int j=0; j<size; j++) {
-                cin >> val;
+                inFile >> val;
                 to_send.push_back(val);
             }
         } else {
             for(int j=0; j<size; j++) {
-                cin >> val;
+                inFile >> val;
                 if(val == PROCESS_ID) {
-                    to_recv.push_back(val);
+                    to_recv.push_back(i);
                 }
             }
         }
     }
 
     for(int i=0; i<N; i++) {
-        cin >> size;
+        inFile >> size;
         assert(size == 1);
-        cin >> val;
+        inFile >> val;
         if(i == PROCESS_ID) {
             to_send_snapshot = val;
-            break;
         }
         if(val == PROCESS_ID && i != PROCESS_ID) {
             to_send_terminate.push_back(i);
@@ -604,6 +651,15 @@ int main2(int argc, const char* argv[]) {
     }, &p);
     thread process_msg_thread([](process *p){
         p->process_messages();
+    }, &p);
+    thread snapshot_trigger_thread([](process *p){
+        if(!p->root()) {
+            return;
+        }
+        while(!(p->end.load())) {
+            p->trigger_snapshot();
+            sleep(1);
+        }
     }, &p);
     
     // send
@@ -623,11 +679,16 @@ int main2(int argc, const char* argv[]) {
     sleep(3);
     p.end_proc();
 
-    recv_thread.join();
+    process_msg_thread.join();
+    snapshot_trigger_thread.join();
+    // recv_thread.join();
 
-    printf("Ending Process%d\n", PROCESS_ID);
+    printf("Ending Process %d\n", PROCESS_ID);
     fflush(stdout);
-    
+    printf("IGNORE THE CRASH, THAT IS INTENTIONAL\n");
+    fflush(stdout);
+
     MPI_Finalize();
+    
     return 0;
 }

@@ -3,4 +3,4 @@ CXX=mpic++
 all: CL
 
 CL:
-	$(CXX) CL.cpp -o CL.out
+	$(CXX) CL.cpp -o CL.out -lpthread
