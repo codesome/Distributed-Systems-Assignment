@@ -24,7 +24,7 @@
 #include "channel.hpp"
 using namespace std;
 
-int PROCESS_ID, MAX_TRANSACTION, ROOT;
+int PROCESS_ID, MAX_TRANSACTION, ROOT, SEND_MSG_ID;
 
 const int max_size = 65536;
 
@@ -75,8 +75,9 @@ int read_int(void **ptr) {
     return v;
 }
 
-int message_marshal_size = sizeof(int) + (3*sizeof(char));
+int message_marshal_size = (2*sizeof(int)) + (3*sizeof(char));
 struct message {
+    int id;
     char from, to;
     COLOR color;
     int amount;
@@ -84,6 +85,7 @@ struct message {
     message() {}
 
     message(char from, char to, COLOR color) {
+        this->id = SEND_MSG_ID++;
         this->from = from;
         this->to = to;
         this->color = color;
@@ -91,6 +93,7 @@ struct message {
 
     int marshal(void *original) {
         void *ptr = original;
+        ptr = write_int(ptr, id);
         ptr = write_char(ptr, from);
         ptr = write_char(ptr, to);
         ptr = write_char(ptr, color);
@@ -100,6 +103,7 @@ struct message {
     
     void unmarshal(void *original) {
         void *ptr = original;
+        id = read_int(&ptr);
         from = read_char(&ptr);
         to = read_char(&ptr);
         color = (COLOR)read_char(&ptr);
@@ -257,8 +261,6 @@ public:
     total_amount_recv(0),
     curr_send_pointer(-1),
     snap_count(0) {
-        // TODO: fix this
-        // 2+(N<<1) is the maximum number of elements possible in a message.
         recv_vector = malloc(max_size);
         send_vector = malloc(max_size);
         color = WHITE;
@@ -287,11 +289,11 @@ public:
         snap_dump << "SNAPSHOT " << snap_count << endl;
         int cnt = 0;
         for(auto &s: all_snapshots) {
-            snap_dump << "{\n\tpid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl;
+            snap_dump << "pid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl;
             for(auto &m: s.msgs) {
-                snap_dump << "\t\t{from=" << m.from << ",to=" << m.to << ",amount=" << m.amount << "}\n";
+                snap_dump << "\t{from=" << int(m.from) << ",to=" << int(m.to) << ",amount=" << m.amount << "}\n";
             }
-            snap_dump << "}\n";
+            snap_dump << "\n";
         }
     }
 
@@ -442,9 +444,9 @@ public:
                     m.unmarshal(data);
                     total_amount += m.amount;
                     total_amount_recv += m.amount;
-                    printf("AMOUNT RECEIVED (%d <- %d): %d\n", PROCESS_ID, m.from, m.amount);
+                    printf("(%d) AMOUNT RECEIVED (%d <- %d): %d\n", m.id, PROCESS_ID, m.from, m.amount);
                     fflush(stdout);
-                    if(color == RED && m.color == WHITE) {
+                    if(color == RED && m.color == WHITE && !marker_received[m.from]) {
                         my_snapshot.msgs.push_back(m);
                     }
                     break;
@@ -623,6 +625,7 @@ int main(int argc, const char* argv[]) {
     }
 
     MAX_TRANSACTION = T;
+    SEND_MSG_ID = 0;
 
 	distribution = new exponential_distribution<double>(lambda);
 
@@ -684,7 +687,6 @@ int main(int argc, const char* argv[]) {
     }, &p);
     
     // send
-    fflush(stdout);
     while(!p.end.load()) {
         p.send_event();
         p.internal_event();
