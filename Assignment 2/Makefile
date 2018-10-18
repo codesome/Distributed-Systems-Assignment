@@ -1,6 +1,6 @@
 CXX=mpic++
 
-all: CL
+all: CL LY
 
 CL:
 	$(CXX) CL.cpp -o CL.out -lpthread

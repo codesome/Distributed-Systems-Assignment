@@ -24,7 +24,7 @@
 #include "channel.hpp"
 using namespace std;
 
-int PROCESS_ID, MAX_TRANSACTION, ROOT, SEND_MSG_ID;
+int PROCESS_ID, MAX_TRANSACTION, ROOT, SEND_MSG_ID, TOTAL_PROCS;
 
 const int max_size = 65536;
 
@@ -114,15 +114,13 @@ struct message {
 struct snapshot {
     int pid;
     int transferred, current, recv;
-    vector<message> msgs;
+    vector<vector<message>> sent_msgs, rcvd_msgs;
 
-    // 1 int for the number of msgs.
-    int marshal_base_size = 4*sizeof(int);
+    int marshal_base_size = 3*sizeof(int);
 
     void clear() {
         transferred = 0;
         current = 0;
-        msgs.clear();
     }
 
     int marshal(void *original) {
@@ -131,12 +129,29 @@ struct snapshot {
         ptr = write_int(ptr, transferred);
         ptr = write_int(ptr, current);
 
-        ptr = write_int(ptr, msgs.size());
-        for(auto &m: msgs) {
-            increment(&ptr, m.marshal(ptr));
-        }
+        int total_size = marshal_base_size;
 
-        int total_size = marshal_base_size + (message_marshal_size * msgs.size());
+        // Sent messages.
+        ptr = write_int(ptr, sent_msgs.size());
+        total_size += sizeof(int);
+        for(auto &sm: sent_msgs) {
+            ptr = write_int(ptr, sm.size());
+            for(auto &m: sm) {
+                increment(&ptr, m.marshal(ptr));
+            }
+            total_size += sizeof(int) + (message_marshal_size * sm.size());
+        }
+        
+        // Received messages.
+        ptr = write_int(ptr, rcvd_msgs.size());
+        total_size += sizeof(int);
+        for(auto &rm: rcvd_msgs) {
+            ptr = write_int(ptr, rm.size());
+            for(auto &m: rm) {
+                increment(&ptr, m.marshal(ptr));
+            }
+            total_size += sizeof(int) + (message_marshal_size * rm.size());
+        }
 
         return total_size;
     }
@@ -146,21 +161,36 @@ struct snapshot {
         pid = read_int(&ptr);
         transferred = read_int(&ptr);
         current = read_int(&ptr);
-        
+
+        // Sent messages.
         int size = read_int(&ptr);
-        msgs.resize(size);
+        assert(size == TOTAL_PROCS);
+        sent_msgs.resize(size);
         for(int i=0; i<size; i++) {
-            msgs[i].unmarshal(ptr);
-            increment(&ptr, message_marshal_size);
+            int size2 = read_int(&ptr);
+            sent_msgs[i].resize(size2);
+            for(int j=0; j<size2; j++) {
+                sent_msgs[i][j].unmarshal(ptr);
+                increment(&ptr, message_marshal_size);
+            }
+        }
+
+        // Received messages.
+        size = read_int(&ptr);
+        assert(size == TOTAL_PROCS);
+        rcvd_msgs.resize(size);
+        for(int i=0; i<size; i++) {
+            int size2 = read_int(&ptr);
+            rcvd_msgs[i].resize(size2);
+            for(int j=0; j<size2; j++) {
+                rcvd_msgs[i][j].unmarshal(ptr);
+                increment(&ptr, message_marshal_size);
+            }
         }
     }
 
     void print() {
-        printf("pid=%d, transferred=%d, recv=%d, current=%d, msgs={", pid, transferred, recv, current);
-        for(auto &m: msgs) {
-            printf(" {from=%d,to=%d,color=%d,amount=%d}", m.from, m.to, m.color, m.amount);
-        }
-        printf(" }\n");
+        printf("pid=%d, transferred=%d, recv=%d, current=%d\n", pid, transferred, recv, current);
         fflush(stdout);
     }
 
@@ -172,41 +202,6 @@ struct buffer_message {
     buffer_message(): data(NULL), size(0) {}
     buffer_message(void *data, int size): data(data), size(size) {}
 };
-
-
-int main2() {
-
-    snapshot snap;
-    snap.pid = 1;
-    snap.transferred = 234;
-    snap.current = 2346354;
-
-    message m(1,2,WHITE);
-    m.amount = 24;
-    snap.msgs.push_back(m);
-    m.to = 3;
-    m.color = RED;
-    m.amount = 65;
-    snap.msgs.push_back(m);
-    m.to = 4;
-    m.color = WHITE;
-    m.amount = 97;
-    snap.msgs.push_back(m);
-
-    snap.print();
-
-    void *ptr = malloc(200);
-    int size = snap.marshal(ptr);
-    cout << "marshal size " << size << endl;
-
-    snapshot snap2;
-    snap2.unmarshal(ptr);
-    snap2.print();
-
-
-    return 0;
-}
-
 
 // process represents a single instance of a distributed system.
 class process {
@@ -240,6 +235,7 @@ public:
     vector<int> snapshot_received;
     ofstream snap_dump;
     int snap_count;
+    bool in_a_snapshot;
 
     process(int N, vector<int> to_send, vector<int> to_recv, int to_send_snapshot, vector<int> to_send_terminate, int total_amount): 
     N(N), 
@@ -253,6 +249,7 @@ public:
     total_amount_recv(0),
     curr_send_pointer(-1),
     snap_count(0) {
+        in_a_snapshot = false;
         recv_vector = malloc(max_size);
         send_vector = malloc(max_size);
         color = WHITE;
@@ -260,6 +257,8 @@ public:
             snapshot_received.resize(N);
             snap_dump.open("snapshot_dump.txt");
         }
+        my_snapshot.sent_msgs.resize(N);
+        my_snapshot.rcvd_msgs.resize(N);
     }
 
     void end_proc() {
@@ -275,20 +274,6 @@ public:
         return PROCESS_ID == ROOT;
     }
 
-    void dump_snapshot() {
-        snap_count++;
-        snap_dump << "===============================================================================\n";
-        snap_dump << "SNAPSHOT " << snap_count << endl;
-        int cnt = 0;
-        for(auto &s: all_snapshots) {
-            snap_dump << "pid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl;
-            for(auto &m: s.msgs) {
-                snap_dump << "\t{from=" << int(m.from) << ",to=" << int(m.to) << ",amount=" << m.amount << "}\n";
-            }
-            snap_dump << "\n";
-        }
-    }
-
     bool all_markers_received() {
         for(auto p: to_recv) {
             if(!marker_received[p]) {
@@ -301,6 +286,8 @@ public:
     bool all_snapshots_received() {
         for(int i=0; i<N; i++) {
             if(!snapshot_received[i]) {
+                printf("*************** NOT RECV FROM %d\n", i);
+                fflush(stdout);
                 return false;
             }
         }
@@ -308,11 +295,11 @@ public:
     }
 
     void trigger_snapshot() {
-        if(color == RED || end.load()) {
+        if(root() && (in_a_snapshot || end.load())) {
             return;
         }
         send_mtx.lock();
-        color = RED;
+        in_a_snapshot = true;
         all_snapshots.clear();
         my_snapshot.clear();
         my_snapshot.pid = PROCESS_ID;
@@ -333,7 +320,7 @@ public:
         cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, MARKER);
         cpy = write_int(cpy, PROCESS_ID);
-        for(auto p: to_send) {
+        for(auto p: to_send_terminate) {
             if(MPI_Isend(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
                 printf("MARKER: %d -> %d\n", PROCESS_ID, p);
                 fflush(stdout);
@@ -343,13 +330,14 @@ public:
         }
         send_mtx.unlock();
 
-        if(root() && all_markers_received()) {
+        if(root()) {
             if(!snapshot_received[PROCESS_ID]) {
                 all_snapshots.push_back(my_snapshot);
                 snapshot_received[PROCESS_ID] = true;
             }
             color = WHITE;
             if(all_snapshots_received()) {
+                in_a_snapshot = false;
                 root_termination_check();
             }
         }
@@ -358,14 +346,36 @@ public:
     void root_termination_check() {
         int system_total = 0;
         int total_transaction = 0;
+        snap_count++; // dump
+        snap_dump << "===============================================================================\n"; // dump
+        snap_dump << "SNAPSHOT " << snap_count << endl; // dump
+        int cnt = 0; // dump
         for(auto &s: all_snapshots) {
             system_total += s.current;
-            for(auto &m: s.msgs) {
-                system_total += m.amount;
-            }
             total_transaction += s.transferred;
+            snap_dump << "pid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl; // dump
+            snap_dump << "\n"; // dump
         }
-        dump_snapshot();
+        for(int i=0; i<N; i++) { // sent
+            for(int j=0; j<N; j++) { // received
+                vector<message> &sent = all_snapshots[i].sent_msgs[j];
+                vector<message> &received = all_snapshots[j].rcvd_msgs[i];
+                for(auto &m: sent) { // for messages sent
+                    bool exists = false;
+                    for(auto &r: received) { // which is not received
+                        if(m.id == r.id) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if(!exists) { // not received, so in transit
+                        snap_dump << "\t{id="<< m.id <<",from=" << int(m.from) << ",to=" << int(m.to) << ",amount=" << m.amount << "}\n"; // dump
+                        system_total += m.amount;
+                    }
+                }
+            }
+        }
+        snap_dump << "SNAPSHOT: total_process="<<all_snapshots.size()<<", system_total="<<system_total<<", total_transaction="<<total_transaction<<"\n";
         printf("SNAPSHOT: total_process=%lu, system_total=%d, total_transaction=%d\n", all_snapshots.size(), system_total, total_transaction);
         fflush(stdout);
         if(total_transaction > MAX_TRANSACTION) {
@@ -449,8 +459,8 @@ public:
                     total_amount_recv += m.amount;
                     printf("(%d) AMOUNT RECEIVED (%d <- %d): %d\n", m.id, PROCESS_ID, m.from, m.amount);
                     fflush(stdout);
-                    if(color == RED && m.color == WHITE && !marker_received[m.from]) {
-                        my_snapshot.msgs.push_back(m);
+                    if(m.color == WHITE) {
+                        my_snapshot.rcvd_msgs[m.from].push_back(m);
                     }
                     break;
                 } // DATA
@@ -465,7 +475,7 @@ public:
                                 trigger_snapshot();
                             }
                             marker_received[from] = true;
-                            if(all_markers_received()) {
+                            
                                 send_mtx.lock();
                                 printf("SNAPSHOT DONE: %d\n", PROCESS_ID);
                                 fflush(stdout);
@@ -476,6 +486,7 @@ public:
                                     }
                                     color = WHITE;
                                     if(all_snapshots_received()) {
+                                        in_a_snapshot = false;
                                         root_termination_check();
                                     }
                                     send_mtx.unlock();
@@ -498,7 +509,6 @@ public:
 
                                 color = WHITE;
                                 send_mtx.unlock();
-                            }
                             break;
                         } // MARKER
                         case SNAPSHOT: {
@@ -511,6 +521,7 @@ public:
                                 snapshot_received[s.pid] = true;
 
                                 if(all_snapshots_received()) {
+                                    in_a_snapshot = false;
                                     root_termination_check();
                                 }
 
@@ -587,6 +598,9 @@ public:
         if(MPI_Isend(send_vector, message_size, MPI_BYTE, send_to, 0, MPI_COMM_WORLD, &request) == 0) {
             total_amount -= transaction_amount;
             total_amount_sent += transaction_amount;
+            if(m.color == WHITE) {
+                my_snapshot.sent_msgs[m.to].push_back(m);
+            }
             printf("Process %d sends %d to process %d\n", PROCESS_ID, transaction_amount, send_to);
             fflush(stdout);
         } else {
@@ -629,6 +643,7 @@ int main(int argc, const char* argv[]) {
 
     MAX_TRANSACTION = T;
     SEND_MSG_ID = 0;
+    TOTAL_PROCS = N;
 
 	distribution = new exponential_distribution<double>(lambda);
 
