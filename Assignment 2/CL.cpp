@@ -24,13 +24,14 @@
 #include "channel.hpp"
 using namespace std;
 
-int PROCESS_ID, MAX_TRANSACTION;
+int PROCESS_ID, MAX_TRANSACTION, ROOT;
 
 const int max_size = 65536;
 
 default_random_engine generator;
 exponential_distribution<double> *distribution; // for sleep.
-uniform_int_distribution<int> toss_coin(0,1);
+
+MPI_Request request;
 
 enum COLOR : char {
     WHITE = 0, RED = 1
@@ -74,7 +75,7 @@ int read_int(void **ptr) {
     return v;
 }
 
-int message_marshall_size = sizeof(int) + (3*sizeof(char));
+int message_marshal_size = sizeof(int) + (3*sizeof(char));
 struct message {
     char from, to;
     COLOR color;
@@ -88,16 +89,16 @@ struct message {
         this->color = color;
     }
 
-    int marshall(void *original) {
+    int marshal(void *original) {
         void *ptr = original;
         ptr = write_char(ptr, from);
         ptr = write_char(ptr, to);
         ptr = write_char(ptr, color);
         ptr = write_int(ptr, amount);
-        return message_marshall_size;
+        return message_marshal_size;
     }
     
-    void unmarshall(void *original) {
+    void unmarshal(void *original) {
         void *ptr = original;
         from = read_char(&ptr);
         to = read_char(&ptr);
@@ -112,7 +113,7 @@ struct snapshot {
     vector<message> msgs;
 
     // 1 int for the number of msgs.
-    int marshall_base_size = 4*sizeof(int);
+    int marshal_base_size = 4*sizeof(int);
 
     void clear() {
         transferred = 0;
@@ -120,7 +121,7 @@ struct snapshot {
         msgs.clear();
     }
 
-    int marshall(void *original) {
+    int marshal(void *original) {
         void *ptr = original;
         ptr = write_int(ptr, pid);
         ptr = write_int(ptr, transferred);
@@ -128,15 +129,15 @@ struct snapshot {
 
         ptr = write_int(ptr, msgs.size());
         for(auto &m: msgs) {
-            increment(&ptr, m.marshall(ptr));
+            increment(&ptr, m.marshal(ptr));
         }
 
-        int total_size = marshall_base_size + (message_marshall_size * msgs.size());
+        int total_size = marshal_base_size + (message_marshal_size * msgs.size());
 
         return total_size;
     }
 
-    void unmarshall(void *original) {
+    void unmarshal(void *original) {
         void *ptr = original;
         pid = read_int(&ptr);
         transferred = read_int(&ptr);
@@ -145,8 +146,8 @@ struct snapshot {
         int size = read_int(&ptr);
         msgs.resize(size);
         for(int i=0; i<size; i++) {
-            msgs[i].unmarshall(ptr);
-            increment(&ptr, message_marshall_size);
+            msgs[i].unmarshal(ptr);
+            increment(&ptr, message_marshal_size);
         }
     }
 
@@ -199,11 +200,11 @@ int main2() {
     snap.print();
 
     void *ptr = malloc(200);
-    int size = snap.marshall(ptr);
-    cout << "Marshall size " << size << endl;
+    int size = snap.marshal(ptr);
+    cout << "marshal size " << size << endl;
 
     snapshot snap2;
-    snap2.unmarshall(ptr);
+    snap2.unmarshal(ptr);
     snap2.print();
 
 
@@ -277,7 +278,7 @@ public:
     }
 
     bool root() {
-        return PROCESS_ID == to_send_snapshot;
+        return PROCESS_ID == ROOT;
     }
 
     void dump_snapshot() {
@@ -293,26 +294,6 @@ public:
             snap_dump << "}\n";
         }
     }
-
-    // A single message receive event.
-    void recv_event() {
-        // receive message.
-        MPI_Status status;
-        if(MPI_Recv(recv_vector, max_size, MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status) != 0) {
-            return;
-        }
-        int size;
-        MPI_Get_count(&status, MPI_BYTE, &size);
-        // auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-        if(size <= 0) {
-            return;
-        }
-
-        void *cpy = malloc(size);
-        memcpy(cpy, recv_vector, size);
-        recv_buffer.add(buffer_message(cpy, size));
-
-    };
 
     bool all_markers_received() {
         for(auto p: to_recv) {
@@ -359,7 +340,7 @@ public:
         cpy = write_char(cpy, MARKER);
         cpy = write_int(cpy, PROCESS_ID);
         for(auto p: to_send) {
-            if(MPI_Send(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD) == 0) {
+            if(MPI_Isend(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
                 printf("MARKER: %d -> %d\n", PROCESS_ID, p);
                 fflush(stdout);
             } else {
@@ -384,19 +365,19 @@ public:
         fflush(stdout);
         if(total_transaction > MAX_TRANSACTION) {
             printf("### snapshot termination\n");
-            send_termination();
+            send_all_terminations();
             end_proc();
         }
     }
 
-    void send_termination() {
+    void send_all_terminations() {
         send_mtx.lock();
         // send terminate to all
         void *cpy = send_vector;
         // cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, TERMINATE);
         for(auto p: to_send_terminate) {
-            if(MPI_Send(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD) == 0) {
+            if(MPI_Isend(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
                 printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
                 fflush(stdout);
             } else {
@@ -405,6 +386,44 @@ public:
         }
         send_mtx.unlock();
     }
+
+    void send_termination_to(int p) {
+        send_mtx.lock();
+        // send terminate to all
+        void *cpy = send_vector;
+        // cpy = write_char(cpy, CONTROL);
+        cpy = write_char(cpy, TERMINATE);
+        if(MPI_Isend(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
+            printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
+            fflush(stdout);
+        } else {
+            printf("### SEND ERROR\n"); fflush(stdout);
+        }
+        send_mtx.unlock();
+    }
+
+    // A single message receive event.
+    bool recv_event() {
+        // receive message.
+        MPI_Status status;
+        if(MPI_Recv(recv_vector, max_size, MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status) != 0) {
+            return true;
+        }
+        int size;
+        MPI_Get_count(&status, MPI_BYTE, &size);
+        if(size <= 0) {
+            return true;
+        }
+
+        MESSAGE_TYPE type = MESSAGE_TYPE(*((char*)recv_vector));
+        if(type != TERMINATE || !root()) {
+            void *cpy = malloc(size);
+            memcpy(cpy, recv_vector, size);
+            recv_buffer.add(buffer_message(cpy, size));
+        }
+
+        return type != TERMINATE;
+    };
 
     void process_messages() {
         bool is_closed;
@@ -420,7 +439,7 @@ public:
             switch(type) {
                 case DATA: {
                     message m;
-                    m.unmarshall(data);
+                    m.unmarshal(data);
                     total_amount += m.amount;
                     total_amount_recv += m.amount;
                     printf("AMOUNT RECEIVED (%d <- %d): %d\n", PROCESS_ID, m.from, m.amount);
@@ -462,10 +481,10 @@ public:
                                 cpy = write_char(cpy, CONTROL);
                                 cpy = write_char(cpy, SNAPSHOT);
                                 cpy = write_int(cpy, PROCESS_ID);
-                                int size = my_snapshot.marshall(cpy) + (2*sizeof(char)) + sizeof(int);
+                                int size = my_snapshot.marshal(cpy) + (2*sizeof(char)) + sizeof(int);
 
                                 my_snapshot.print();
-                                if(MPI_Send(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD) == 0) {
+                                if(MPI_Isend(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
                                     printf("SNAPSHOT SENT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
                                     fflush(stdout);
                                 } else {
@@ -482,7 +501,7 @@ public:
                             fflush(stdout);
                             if(root()) {
                                 snapshot s;
-                                s.unmarshall(data);
+                                s.unmarshal(data);
                                 all_snapshots.push_back(s);
                                 snapshot_received[s.pid] = true;
 
@@ -493,7 +512,7 @@ public:
                                 break;
                             }
                             send_mtx.lock();
-                            if(MPI_Send(msg.data, msg.size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD) == 0) {
+                            if(MPI_Isend(msg.data, msg.size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
                                 printf("FORWARD SNAPSHOT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
                                 fflush(stdout);
                             } else {
@@ -511,7 +530,7 @@ public:
                 case TERMINATE: {
                     printf("TRMINATE: %d\n", PROCESS_ID);
                     fflush(stdout);
-                    send_termination();
+                    send_all_terminations();
                     end_proc();
                     break;
                 } // TERMINATE
@@ -534,7 +553,7 @@ public:
     // Internal event.
     void internal_event() {
         auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-        usleep((*distribution)(generator)*300000); // simulation some process.
+        usleep((*distribution)(generator)*3000000); // simulation some process.
         printf("Process %d executes internal event\n", PROCESS_ID);
         fflush(stdout);
     };
@@ -558,9 +577,9 @@ public:
         m.amount = transaction_amount;
 
         void *ptr = write_char(send_vector, DATA);
-        int message_size = m.marshall(ptr) + sizeof(char);
+        int message_size = m.marshal(ptr) + sizeof(char);
         // auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-        if(MPI_Send(send_vector, message_size, MPI_BYTE, send_to, 0, MPI_COMM_WORLD) == 0) {
+        if(MPI_Isend(send_vector, message_size, MPI_BYTE, send_to, 0, MPI_COMM_WORLD, &request) == 0) {
             total_amount -= transaction_amount;
             total_amount_sent += transaction_amount;
             printf("Process %d sends %d to process %d\n", PROCESS_ID, transaction_amount, send_to);
@@ -574,7 +593,6 @@ public:
 
 int main(int argc, const char* argv[]) {
 
-    printf("P1\n");
     fflush(stdout);
     MPI_Init(NULL, NULL);
     // Find out rank, size
@@ -586,7 +604,6 @@ int main(int argc, const char* argv[]) {
     srand(time(NULL));
 
     PROCESS_ID = world_rank;
-    printf("P2\n");
 
     ifstream inFile;
     inFile.open("inp-params.txt");
@@ -639,6 +656,9 @@ int main(int argc, const char* argv[]) {
         if(val == PROCESS_ID && i != PROCESS_ID) {
             to_send_terminate.push_back(i);
         }
+        if(i == val) {
+            ROOT = i;
+        }
     }
 
     process p(N, to_send, to_recv, to_send_snapshot, to_send_terminate, A);
@@ -646,7 +666,8 @@ int main(int argc, const char* argv[]) {
     // recv thread
     thread recv_thread([](process *p){
         while(!(p->end.load())) {
-            p->recv_event();
+            if(!(p->recv_event()))
+                break;
         }
     }, &p);
     thread process_msg_thread([](process *p){
@@ -663,16 +684,10 @@ int main(int argc, const char* argv[]) {
     }, &p);
     
     // send
-    printf("Sending\n");
     fflush(stdout);
     while(!p.end.load()) {
-        // Randomly select message send or internal event.
-        // Do this till we have to perform both the operations.
-        if(toss_coin(generator)) {
-            p.send_event();
-        } else {
-            p.internal_event();
-        }
+        p.send_event();
+        p.internal_event();
     }
 
     // This sleep is just to make sure that all sending messages are complete before we stop receiving.
@@ -681,11 +696,13 @@ int main(int argc, const char* argv[]) {
 
     process_msg_thread.join();
     snapshot_trigger_thread.join();
-    // recv_thread.join();
+    recv_thread.join();
+
+    if(PROCESS_ID == (ROOT+1)%N) {
+        p.send_termination_to(ROOT);
+    }
 
     printf("Ending Process %d\n", PROCESS_ID);
-    fflush(stdout);
-    printf("IGNORE THE CRASH, THAT IS INTENTIONAL\n");
     fflush(stdout);
 
     MPI_Finalize();
