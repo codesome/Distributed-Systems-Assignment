@@ -173,41 +173,6 @@ struct buffer_message {
     buffer_message(void *data, int size): data(data), size(size) {}
 };
 
-
-int main2() {
-
-    snapshot snap;
-    snap.pid = 1;
-    snap.transferred = 234;
-    snap.current = 2346354;
-
-    message m(1,2,WHITE);
-    m.amount = 24;
-    snap.msgs.push_back(m);
-    m.to = 3;
-    m.color = RED;
-    m.amount = 65;
-    snap.msgs.push_back(m);
-    m.to = 4;
-    m.color = WHITE;
-    m.amount = 97;
-    snap.msgs.push_back(m);
-
-    snap.print();
-
-    void *ptr = malloc(200);
-    int size = snap.marshal(ptr);
-    cout << "marshal size " << size << endl;
-
-    snapshot snap2;
-    snap2.unmarshal(ptr);
-    snap2.print();
-
-
-    return 0;
-}
-
-
 // process represents a single instance of a distributed system.
 class process {
 public:
@@ -258,7 +223,7 @@ public:
         color = WHITE;
         if(root()) {
             snapshot_received.resize(N);
-            snap_dump.open("snapshot_dump.txt");
+            snap_dump.open("snapshot_dump_CL.txt");
         }
     }
 
@@ -275,11 +240,10 @@ public:
         return PROCESS_ID == ROOT;
     }
 
-    void dump_snapshot() {
+    void dump_snapshot(int system_total, int total_transaction) {
         snap_count++;
         snap_dump << "===============================================================================\n";
         snap_dump << "SNAPSHOT " << snap_count << endl;
-        int cnt = 0;
         for(auto &s: all_snapshots) {
             snap_dump << "pid=" << s.pid << ", transferred=" << s.transferred << ", current=" << s.current << endl;
             for(auto &m: s.msgs) {
@@ -287,6 +251,7 @@ public:
             }
             snap_dump << "\n";
         }
+        snap_dump << "SNAPSHOT: total_process="<<all_snapshots.size()<<", system_total="<<system_total<<", total_transaction="<<total_transaction<<"\n";
     }
 
     bool all_markers_received() {
@@ -365,7 +330,7 @@ public:
             }
             total_transaction += s.transferred;
         }
-        dump_snapshot();
+        dump_snapshot(system_total, total_transaction);
         printf("SNAPSHOT: total_process=%lu, system_total=%d, total_transaction=%d\n", all_snapshots.size(), system_total, total_transaction);
         fflush(stdout);
         if(total_transaction > MAX_TRANSACTION) {
@@ -557,7 +522,6 @@ public:
 
     // Internal event.
     void internal_event() {
-        auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         usleep((*distribution)(generator)*3000000); // simulation some process.
         printf("Process %d executes internal event\n", PROCESS_ID);
         fflush(stdout);
@@ -598,7 +562,6 @@ public:
 
 int main(int argc, const char* argv[]) {
 
-    fflush(stdout);
     MPI_Init(NULL, NULL);
     // Find out rank, size
     int world_rank;
@@ -616,16 +579,12 @@ int main(int argc, const char* argv[]) {
     float lambda;
     vector<int> to_send, to_recv, to_send_terminate;
     inFile >> N >> A >> T >> lambda;
-    if(!(
-        (N > 0) &&
-        (N == world_size) &&
-        (PROCESS_ID < N) &&
-        (A > 0) &&
-        (T > 0) &&
-        (lambda > 0)
-    )) {
-        MPI_Abort(MPI_COMM_WORLD, -1);
-    }
+    assert(N > 0);
+    assert(N == world_size);
+    assert(PROCESS_ID < N);
+    assert(A > 0);
+    assert(T > 0);
+    assert(lambda > 0);
 
     MAX_TRANSACTION = T;
     SEND_MSG_ID = 0;

@@ -217,7 +217,7 @@ public:
 
     // This is the adjacent processess to his process in the graph topology
     // to which it has to send the messages.
-    vector<int> to_send, to_recv, to_send_terminate;
+    vector<int> to_send, to_recv, to_send_marker_terminate;
     map<int,bool> marker_received;
     int to_send_snapshot;
     int curr_send_pointer;
@@ -237,12 +237,12 @@ public:
     int snap_count;
     bool in_a_snapshot;
 
-    process(int N, vector<int> to_send, vector<int> to_recv, int to_send_snapshot, vector<int> to_send_terminate, int total_amount): 
+    process(int N, vector<int> to_send, vector<int> to_recv, int to_send_snapshot, vector<int> to_send_marker_terminate, int total_amount): 
     N(N), 
     to_send(to_send), 
     to_recv(to_recv), 
     to_send_snapshot(to_send_snapshot), 
-    to_send_terminate(to_send_terminate),
+    to_send_marker_terminate(to_send_marker_terminate),
     total_amount(total_amount), 
     end(false),
     total_amount_sent(0),
@@ -255,7 +255,7 @@ public:
         color = WHITE;
         if(root()) {
             snapshot_received.resize(N);
-            snap_dump.open("snapshot_dump.txt");
+            snap_dump.open("snapshot_dump_LY.txt");
         }
         my_snapshot.sent_msgs.resize(N);
         my_snapshot.rcvd_msgs.resize(N);
@@ -286,8 +286,6 @@ public:
     bool all_snapshots_received() {
         for(int i=0; i<N; i++) {
             if(!snapshot_received[i]) {
-                printf("*************** NOT RECV FROM %d\n", i);
-                fflush(stdout);
                 return false;
             }
         }
@@ -320,7 +318,7 @@ public:
         cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, MARKER);
         cpy = write_int(cpy, PROCESS_ID);
-        for(auto p: to_send_terminate) {
+        for(auto p: to_send_marker_terminate) {
             if(MPI_Isend(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
                 printf("MARKER: %d -> %d\n", PROCESS_ID, p);
                 fflush(stdout);
@@ -349,7 +347,6 @@ public:
         snap_count++; // dump
         snap_dump << "===============================================================================\n"; // dump
         snap_dump << "SNAPSHOT " << snap_count << endl; // dump
-        int cnt = 0; // dump
         for(auto &s: all_snapshots) {
             system_total += s.current;
             total_transaction += s.transferred;
@@ -391,7 +388,7 @@ public:
         void *cpy = send_vector;
         // cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, TERMINATE);
-        for(auto p: to_send_terminate) {
+        for(auto p: to_send_marker_terminate) {
             if(MPI_Isend(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
                 printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
                 fflush(stdout);
@@ -568,7 +565,6 @@ public:
 
     // Internal event.
     void internal_event() {
-        auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         usleep((*distribution)(generator)*3000000); // simulation some process.
         printf("Process %d executes internal event\n", PROCESS_ID);
         fflush(stdout);
@@ -612,7 +608,6 @@ public:
 
 int main(int argc, const char* argv[]) {
 
-    fflush(stdout);
     MPI_Init(NULL, NULL);
     // Find out rank, size
     int world_rank;
@@ -628,18 +623,14 @@ int main(int argc, const char* argv[]) {
     inFile.open("inp-params.txt");
     int N, A, T;
     float lambda;
-    vector<int> to_send, to_recv, to_send_terminate;
+    vector<int> to_send, to_recv, to_send_marker_terminate;
     inFile >> N >> A >> T >> lambda;
-    if(!(
-        (N > 0) &&
-        (N == world_size) &&
-        (PROCESS_ID < N) &&
-        (A > 0) &&
-        (T > 0) &&
-        (lambda > 0)
-    )) {
-        MPI_Abort(MPI_COMM_WORLD, -1);
-    }
+    assert(N > 0);
+    assert(N == world_size);
+    assert(PROCESS_ID < N);
+    assert(A > 0);
+    assert(T > 0);
+    assert(lambda > 0);
 
     MAX_TRANSACTION = T;
     SEND_MSG_ID = 0;
@@ -675,14 +666,14 @@ int main(int argc, const char* argv[]) {
             to_send_snapshot = val;
         }
         if(val == PROCESS_ID && i != PROCESS_ID) {
-            to_send_terminate.push_back(i);
+            to_send_marker_terminate.push_back(i);
         }
         if(i == val) {
             ROOT = i;
         }
     }
 
-    process p(N, to_send, to_recv, to_send_snapshot, to_send_terminate, A);
+    process p(N, to_send, to_recv, to_send_snapshot, to_send_marker_terminate, A);
 
     // recv thread
     thread recv_thread([](process *p){

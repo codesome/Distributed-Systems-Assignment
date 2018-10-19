@@ -3,7 +3,7 @@ import sys
 
 N = int(sys.argv[1])
 A = 1000000
-T = 1000
+T = 10000
 lam = 2
 
 print N, A, T, lam
