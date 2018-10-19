@@ -2,3 +2,4 @@ snapshot_dump*
 dump
 inp-params.txt
 *logs*
+*.zip
