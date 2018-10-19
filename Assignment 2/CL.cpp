@@ -1,122 +1,44 @@
 /*
-    Author: Ganesh Vernekar (CS15BTECH11018)
-*/
+**   Author: Ganesh Vernekar (CS15BTECH11018)
+**/
 
-#include <iostream>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 #include <vector>
 #include <mutex>
 #include <map>
 #include <random>
 #include <chrono>
 #include <fstream>
-#include <string.h>
 #include <assert.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <stdio.h>
-#include <signal.h>
 #include <mpi.h>
-#include "channel.hpp"
+#include "channel.h"
+#include "common.h"
 using namespace std;
 
-int PROCESS_ID, MAX_TRANSACTION, ROOT, SEND_MSG_ID;
 
-const int max_size = 65536;
+int PROCESS_ID, // Current process ID. 
+    MAX_TRANSACTION, // Max total transaction to be done.
+    ROOT, // ID of root.
+    SEND_MSG_ID; // Counter of message sent. Used for message id.
 
+// For random numbers.
 default_random_engine generator;
-exponential_distribution<double> *distribution; // for sleep.
+exponential_distribution<double> *distribution;
 
-MPI_Request request;
+// dummy, just to satisfy function argument.
+MPI_Request request; 
 
-enum COLOR : char {
-    WHITE = 0, RED = 1
-};
-
-enum MESSAGE_TYPE : char {
-    DATA = 0, CONTROL = 1, TERMINATE = 2
-};
-
-enum CONTROL_TYPE : char {
-    MARKER = 0, SNAPSHOT = 1
-};
-
-void increment(void **ptr, int offset) {
-    *ptr = ((char*)(*ptr)) + offset;
-}
-
-void* shift(void *ptr, int offset) {
-    return ((char*)ptr) + offset;
-}
-
-void* write_char(void *ptr, char val) {
-    *((char*)ptr) = val;
-    return (char*)ptr + sizeof(char);
-}
-
-void* write_int(void *ptr, int val) {
-    *((int*)ptr) = val;
-    return (char*)ptr + sizeof(int);
-}
-
-char read_char(void **ptr) {
-    char v = *((char*)(*ptr));
-    *ptr = (char*)(*ptr) + sizeof(char);
-    return v;
-}
-
-int read_int(void **ptr) {
-    int v = *((int*)(*ptr));
-    *ptr = (char*)(*ptr) + sizeof(int);
-    return v;
-}
-
-int message_marshal_size = (2*sizeof(int)) + (3*sizeof(char));
-struct message {
-    int id;
-    char from, to;
-    COLOR color;
-    int amount;
-
-    message() {}
-
-    message(char from, char to, COLOR color) {
-        this->id = SEND_MSG_ID++;
-        this->from = from;
-        this->to = to;
-        this->color = color;
-    }
-
-    int marshal(void *original) {
-        void *ptr = original;
-        ptr = write_int(ptr, id);
-        ptr = write_char(ptr, from);
-        ptr = write_char(ptr, to);
-        ptr = write_char(ptr, color);
-        ptr = write_int(ptr, amount);
-        return message_marshal_size;
-    }
-    
-    void unmarshal(void *original) {
-        void *ptr = original;
-        id = read_int(&ptr);
-        from = read_char(&ptr);
-        to = read_char(&ptr);
-        color = (COLOR)read_char(&ptr);
-        amount = read_int(&ptr);
-    }
-};
-
+// Structure of a single snapshot.
 struct snapshot {
     int pid;
-    int transferred, current, recv;
-    vector<message> msgs;
+    int transferred, // total amount sent. 
+        current; // current amount with the process.
+    vector<message> msgs; // Messages in transit.
 
-    // 1 int for the number of msgs.
     int marshal_base_size = 4*sizeof(int);
 
     void clear() {
@@ -125,6 +47,7 @@ struct snapshot {
         msgs.clear();
     }
 
+    // Encode snapshot into storable format.
     int marshal(void *original) {
         void *ptr = original;
         ptr = write_int(ptr, pid);
@@ -141,6 +64,7 @@ struct snapshot {
         return total_size;
     }
 
+    // Decode snapshot from bytes.
     void unmarshal(void *original) {
         void *ptr = original;
         pid = read_int(&ptr);
@@ -155,82 +79,81 @@ struct snapshot {
         }
     }
 
+    // Print the snapshot. In-transit message will be printed by the root.
     void print() {
-        printf("pid=%d, transferred=%d, recv=%d, current=%d, msgs={", pid, transferred, recv, current);
-        for(auto &m: msgs) {
-            printf(" {from=%d,to=%d,color=%d,amount=%d}", m.from, m.to, m.color, m.amount);
-        }
-        printf(" }\n");
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+        printf("[%ld] pid=%d, transferred=%d, current=%d\n", timestamp, pid, transferred, current);
         fflush(stdout);
     }
 
 };
 
-struct buffer_message {
-    void *data;
-    int size;
-    buffer_message(): data(NULL), size(0) {}
-    buffer_message(void *data, int size): data(data), size(size) {}
-};
-
 // process represents a single instance of a distributed system.
 class process {
 public:
-    int N;
+    int N; // Total number of processess.
     atomic_int total_amount, total_amount_sent, total_amount_recv;
+    atomic_int total_control_msg_rcvd;
     COLOR color;
-
-    map<int,snapshot*> snapshots;
 
     // This is made 'true' when the process has to end.
     atomic_bool end;
 
-    // This is the adjacent processess to his process in the graph topology
-    // to which it has to send the messages.
-    vector<int> to_send, to_recv, to_send_terminate;
+    vector<int> to_send, // Processess to which messages and marker has to be sent. 
+                to_recv, // Processess from which it has to receive markers. 
+                to_send_terminate; // Processess to which it has to sent terminate.
+    
+    // Map of process id to bool, indicating if marker received or no.
     map<int,bool> marker_received;
+
+    // Process to forward snapshot to.
     int to_send_snapshot;
+
+    // Current pointer in 'to_sent' to which message has to be sent.
     int curr_send_pointer;
 
+    // Memory reused to receive and sent messages.
     void *recv_vector, *send_vector;
 
+    // Lock to be acquired while sending messages.
     mutex send_mtx;
 
+    // A thread safe - go style channel to pass messages 
+    // for processing from receive event. 
     Channel<buffer_message> recv_buffer;
 
+    // The current process's snapshot.
     snapshot my_snapshot;
 
-    // coordinator
+    /// coordinator/root specific variables.
+
+    // Snapshots of all the processess.
     vector<snapshot> all_snapshots;
-    vector<int> snapshot_received;
+    // Index i tells if root received snapshot from process i. 
+    vector<bool> snapshot_received;
+    // Stream to dump the snapshots.
     ofstream snap_dump;
+    // Number of snapshots received in total.
     int snap_count;
 
     process(int N, vector<int> to_send, vector<int> to_recv, int to_send_snapshot, vector<int> to_send_terminate, int total_amount): 
-    N(N), 
-    to_send(to_send), 
-    to_recv(to_recv), 
-    to_send_snapshot(to_send_snapshot), 
-    to_send_terminate(to_send_terminate),
-    total_amount(total_amount), 
-    end(false),
-    total_amount_sent(0),
-    total_amount_recv(0),
-    curr_send_pointer(-1),
-    snap_count(0) {
+    N(N), to_send(to_send), to_recv(to_recv), to_send_snapshot(to_send_snapshot), 
+    to_send_terminate(to_send_terminate), total_amount(total_amount), 
+    end(false), total_amount_sent(0), total_amount_recv(0), curr_send_pointer(-1),
+    snap_count(0), color(WHITE), total_control_msg_rcvd(0) {
         recv_vector = malloc(max_size);
         send_vector = malloc(max_size);
-        color = WHITE;
         if(root()) {
             snapshot_received.resize(N);
             snap_dump.open("snapshot_dump_CL.txt");
         }
     }
 
+    // Used to end all sending and receiving of messages.
     void end_proc() {
         if(!end.load()) {
-            recv_buffer.close();
             end.store(true);
+            recv_buffer.close();
             snap_dump << "===============================================================================\n";
             snap_dump.close();
         }
@@ -263,6 +186,7 @@ public:
         return true;
     }
 
+    // Used by root.
     bool all_snapshots_received() {
         for(int i=0; i<N; i++) {
             if(!snapshot_received[i]) {
@@ -272,18 +196,19 @@ public:
         return true;
     }
 
+    // Used to start snapshot process if not started yet.
     void trigger_snapshot() {
         if(color == RED || end.load()) {
             return;
         }
         send_mtx.lock();
+        // Taking my snapshot.
         color = RED;
         all_snapshots.clear();
         my_snapshot.clear();
         my_snapshot.pid = PROCESS_ID;
         my_snapshot.transferred = total_amount_sent.load();
         my_snapshot.current = total_amount.load();
-        my_snapshot.recv = total_amount_recv.load();
         for(auto p: to_recv) {
             marker_received[p] = false;
         }
@@ -293,14 +218,15 @@ public:
             }
         }
 
-        // send marker to all
+        // send marker
         void *cpy = send_vector;
         cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, MARKER);
         cpy = write_int(cpy, PROCESS_ID);
         for(auto p: to_send) {
+            auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
             if(MPI_Isend(send_vector, (2*sizeof(char)) + sizeof(int), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
-                printf("MARKER: %d -> %d\n", PROCESS_ID, p);
+                printf("[%ld] MARKER: %d -> %d\n", timestamp, PROCESS_ID, p);
                 fflush(stdout);
             } else {
                 printf("### SEND ERROR\n"); fflush(stdout);
@@ -309,6 +235,8 @@ public:
         send_mtx.unlock();
 
         if(root() && all_markers_received()) {
+            // Root.
+            // Collect own snapshot if received all markers.
             if(!snapshot_received[PROCESS_ID]) {
                 all_snapshots.push_back(my_snapshot);
                 snapshot_received[PROCESS_ID] = true;
@@ -320,21 +248,29 @@ public:
         }
     }
 
+    // Check if termination condition is reached.
+    // Used only by root.
     void root_termination_check() {
         int system_total = 0;
         int total_transaction = 0;
+        sort(all_snapshots.begin(), all_snapshots.end(), [](const snapshot& lhs, const snapshot& rhs) {
+            return lhs.pid < rhs.pid;
+        });
         for(auto &s: all_snapshots) {
             system_total += s.current;
             for(auto &m: s.msgs) {
+                // Considering in-transit message amount in the total.
                 system_total += m.amount;
             }
             total_transaction += s.transferred;
         }
         dump_snapshot(system_total, total_transaction);
-        printf("SNAPSHOT: total_process=%lu, system_total=%d, total_transaction=%d\n", all_snapshots.size(), system_total, total_transaction);
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+        printf("[%ld] SNAPSHOT: total_process=%lu, system_total=%d, total_transaction=%d\n", timestamp, all_snapshots.size(), system_total, total_transaction);
         fflush(stdout);
         if(total_transaction > MAX_TRANSACTION) {
-            printf("### snapshot termination\n");
+            // Transation limit reached.
+            printf("[%ld] Snapshot termination\n", timestamp);
             send_all_terminations();
             end_proc();
         }
@@ -342,13 +278,12 @@ public:
 
     void send_all_terminations() {
         send_mtx.lock();
-        // send terminate to all
         void *cpy = send_vector;
-        // cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, TERMINATE);
         for(auto p: to_send_terminate) {
+            auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
             if(MPI_Isend(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
-                printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
+                printf("[%ld] SENT TERMINATE: %d -> %d \n", timestamp, PROCESS_ID, p);
                 fflush(stdout);
             } else {
                 printf("### SEND ERROR\n"); fflush(stdout);
@@ -359,12 +294,11 @@ public:
 
     void send_termination_to(int p) {
         send_mtx.lock();
-        // send terminate to all
         void *cpy = send_vector;
-        // cpy = write_char(cpy, CONTROL);
         cpy = write_char(cpy, TERMINATE);
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         if(MPI_Isend(send_vector, sizeof(char), MPI_BYTE, p, 0, MPI_COMM_WORLD, &request) == 0) {
-            printf("SENT TERMINATE: %d -> %d \n", PROCESS_ID, p);
+            printf("[%ld] SENT TERMINATE: %d -> %d \n", timestamp, PROCESS_ID, p);
             fflush(stdout);
         } else {
             printf("### SEND ERROR\n"); fflush(stdout);
@@ -387,8 +321,10 @@ public:
 
         MESSAGE_TYPE type = MESSAGE_TYPE(*((char*)recv_vector));
         if(type != TERMINATE || !root()) {
+            // If it a terminate, we only process it if it's not a root.
             void *cpy = malloc(size);
             memcpy(cpy, recv_vector, size);
+            // Add the packet into the buffer which will be processed by another thread.
             recv_buffer.add(buffer_message(cpy, size));
         }
 
@@ -406,25 +342,30 @@ public:
             void *data = msg.data;
 
             MESSAGE_TYPE type = MESSAGE_TYPE(read_char(&data));
+            auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
             switch(type) {
+                // DATA
                 case DATA: {
                     message m;
                     m.unmarshal(data);
                     total_amount += m.amount;
                     total_amount_recv += m.amount;
-                    printf("(%d) AMOUNT RECEIVED (%d <- %d): %d\n", m.id, PROCESS_ID, m.from, m.amount);
+                    printf("[%ld] (%d) AMOUNT RECEIVED (%d <- %d): %d\n", timestamp, m.id, PROCESS_ID, m.from, m.amount);
                     fflush(stdout);
                     if(color == RED && m.color == WHITE && !marker_received[m.from]) {
                         my_snapshot.msgs.push_back(m);
                     }
                     break;
                 } // DATA
+                // CONTROL
                 case CONTROL: {
+                    total_control_msg_rcvd++;
                     CONTROL_TYPE ctype = CONTROL_TYPE(read_char(&data));
                     int from = read_int(&data);
                     switch(ctype) {
+                        // CONTROL, MARKER
                         case MARKER: {
-                            printf("%d received MARKER from %d\n", PROCESS_ID, from);
+                            printf("[%ld] %d received MARKER from %d\n", timestamp, PROCESS_ID, from);
                             fflush(stdout);
                             if(color==WHITE) {
                                 trigger_snapshot();
@@ -432,7 +373,8 @@ public:
                             marker_received[from] = true;
                             if(all_markers_received()) {
                                 send_mtx.lock();
-                                printf("SNAPSHOT DONE: %d\n", PROCESS_ID);
+                                timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+                                printf("[%ld] SNAPSHOT DONE: %d\n", timestamp, PROCESS_ID);
                                 fflush(stdout);
                                 if(root()) {
                                     if(!snapshot_received[PROCESS_ID]) {
@@ -454,8 +396,9 @@ public:
                                 int size = my_snapshot.marshal(cpy) + (2*sizeof(char)) + sizeof(int);
 
                                 my_snapshot.print();
+                                timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
                                 if(MPI_Isend(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
-                                    printf("SNAPSHOT SENT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
+                                    printf("[%ld] SNAPSHOT SENT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
                                     fflush(stdout);
                                 } else {
                                     printf("### SEND ERROR\n"); fflush(stdout);
@@ -466,24 +409,24 @@ public:
                             }
                             break;
                         } // MARKER
+                        // CONTROL, SNAPSHOT
                         case SNAPSHOT: {
-                            printf("Process %d got snapshot from %d\n", PROCESS_ID, from);
+                            printf("[%ld] Process %d got snapshot from %d\n", timestamp, PROCESS_ID, from);
                             fflush(stdout);
                             if(root()) {
                                 snapshot s;
                                 s.unmarshal(data);
                                 all_snapshots.push_back(s);
                                 snapshot_received[s.pid] = true;
-
                                 if(all_snapshots_received()) {
                                     root_termination_check();
                                 }
-
                                 break;
                             }
                             send_mtx.lock();
+                            timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
                             if(MPI_Isend(msg.data, msg.size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
-                                printf("FORWARD SNAPSHOT: %d -> %d\n", PROCESS_ID, to_send_snapshot);
+                                printf("[%ld] FORWARD SNAPSHOT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
                                 fflush(stdout);
                             } else {
                                 printf("### SEND ERROR\n"); fflush(stdout);
@@ -497,8 +440,9 @@ public:
                     }
                     break;
                 } // CONTROL
+                // TERMINATE
                 case TERMINATE: {
-                    printf("TRMINATE: %d\n", PROCESS_ID);
+                    printf("[%ld] TERMINATE: %d\n", timestamp, PROCESS_ID);
                     fflush(stdout);
                     send_all_terminations();
                     end_proc();
@@ -523,17 +467,20 @@ public:
     // Internal event.
     void internal_event() {
         usleep((*distribution)(generator)*3000000); // simulation some process.
-        printf("Process %d executes internal event\n", PROCESS_ID);
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+        printf("[%ld] Process %d executes internal event\n", timestamp, PROCESS_ID);
         fflush(stdout);
     };
 
     // A single message send event.
     void send_event() {
+        // Process to sent message to.
         curr_send_pointer = (curr_send_pointer+1)%to_send.size();
         int send_to = to_send[curr_send_pointer];
 
         send_mtx.lock();
-        message m(PROCESS_ID, send_to, color);
+        // Randomly selection an amount to send. 
+        message m(SEND_MSG_ID++, PROCESS_ID, send_to, color);
         int total = total_amount.load();
         if(total <= 0) {
             send_mtx.unlock();
@@ -545,13 +492,14 @@ public:
         if(transaction_amount == 0) transaction_amount = 1;
         m.amount = transaction_amount;
 
+        // Sending message.
         void *ptr = write_char(send_vector, DATA);
         int message_size = m.marshal(ptr) + sizeof(char);
-        // auto timestamp = chrono::duration_cast<std::chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         if(MPI_Isend(send_vector, message_size, MPI_BYTE, send_to, 0, MPI_COMM_WORLD, &request) == 0) {
             total_amount -= transaction_amount;
             total_amount_sent += transaction_amount;
-            printf("Process %d sends %d to process %d\n", PROCESS_ID, transaction_amount, send_to);
+            printf("[%ld] Process %d sends %d to process %d\n", timestamp, PROCESS_ID, transaction_amount, send_to);
             fflush(stdout);
         } else {
             printf("### SEND ERROR\n"); fflush(stdout);
@@ -561,30 +509,25 @@ public:
 };
 
 int main(int argc, const char* argv[]) {
+    srand(time(NULL));
 
     MPI_Init(NULL, NULL);
-    // Find out rank, size
     int world_rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     int world_size;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    srand(time(NULL));
-
     PROCESS_ID = world_rank;
 
+    // Input from file.
     ifstream inFile;
     inFile.open("inp-params.txt");
     int N, A, T;
     float lambda;
     vector<int> to_send, to_recv, to_send_terminate;
     inFile >> N >> A >> T >> lambda;
-    assert(N > 0);
-    assert(N == world_size);
-    assert(PROCESS_ID < N);
-    assert(A > 0);
-    assert(T > 0);
-    assert(lambda > 0);
+    assert(N > 0); assert(N == world_size); assert(PROCESS_ID < N);
+    assert(A > 0); assert(T > 0);           assert(lambda > 0);
 
     MAX_TRANSACTION = T;
     SEND_MSG_ID = 0;
@@ -611,6 +554,7 @@ int main(int argc, const char* argv[]) {
         }
     }
 
+    // Input of spanning tree.
     for(int i=0; i<N; i++) {
         inFile >> size;
         assert(size == 1);
@@ -628,16 +572,20 @@ int main(int argc, const char* argv[]) {
 
     process p(N, to_send, to_recv, to_send_snapshot, to_send_terminate, A);
 
-    // recv thread
+    // Receiving messages thread.
     thread recv_thread([](process *p){
         while(!(p->end.load())) {
             if(!(p->recv_event()))
                 break;
         }
     }, &p);
+
+    // Processing messages thread.
     thread process_msg_thread([](process *p){
         p->process_messages();
     }, &p);
+
+    // Thread to trigger snapshots.
     thread snapshot_trigger_thread([](process *p){
         if(!p->root()) {
             return;
@@ -648,7 +596,7 @@ int main(int argc, const char* argv[]) {
         }
     }, &p);
     
-    // send
+    // Send messages and perform internal events.
     while(!p.end.load()) {
         p.send_event();
         p.internal_event();
@@ -663,13 +611,19 @@ int main(int argc, const char* argv[]) {
     recv_thread.join();
 
     if(PROCESS_ID == (ROOT+1)%N) {
+        // The process with id next to root sends terminate to root.
+        // Else root will be stuck at MPI_Recv.
         p.send_termination_to(ROOT);
     }
 
-    printf("Ending Process %d\n", PROCESS_ID);
+    printf("Ending Process %d, Total control messages received = %d\n", PROCESS_ID, p.total_control_msg_rcvd.load());
     fflush(stdout);
 
+    if(p.root()) {
+        printf("Total snapshots = %d\n", p.snap_count);
+        fflush(stdout);
+    }
+
     MPI_Finalize();
-    
     return 0;
 }

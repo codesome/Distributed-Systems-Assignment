@@ -1,5 +1,8 @@
-#ifndef __CHANNEL_HPP__
+/*
+**   Author: Ganesh Vernekar (CS15BTECH11018)
+**/
 
+#ifndef __CHANNEL_HPP__
 #define __CHANNEL_HPP__
 
 #include <queue>
