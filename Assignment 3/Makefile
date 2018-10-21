@@ -10,6 +10,13 @@ build_Raymond:
 Raymond:
 	mpirun -n $(N) Raymond.out > Raymond_logs.txt
 
+sort_logs: sort_raymond_logs
+
+sort_raymond_logs:
+	python sort_logs.py Raymond_logs.txt > Sorted_Raymond_logs.txt 	
+	rm Raymond_logs.txt
+	mv Sorted_Raymond_logs.txt Raymond_logs.txt
+
 gen_input:
 	python gen.py $(N) > inp-params.txt
 
