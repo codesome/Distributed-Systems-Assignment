@@ -143,7 +143,7 @@ public:
                 in_cs,
                 triggered_cs;
 
-    atomic_int num_cs_entry;
+    atomic_int num_cs_entry, total_control_msg;
     
     mutex queue_mtx;
     vector<int> RN;
@@ -154,11 +154,15 @@ public:
 
     token tkn;
 
+    int64_t total_response_time;
+    int64_t start_trigger;
+
     process():
         has_token(false),
         in_cs(false),
         triggered_cs(false),
-        num_cs_entry(0)
+        num_cs_entry(0),
+        total_control_msg(0)
     {
         recv_vector = malloc(max_packet_size);
         send_vector = malloc(max_packet_size);
@@ -273,7 +277,9 @@ public:
                 in_cs.store(true);
                 queue_mtx.unlock();
 
-                cs_computation();
+                thread([this](){
+                    cs_computation();
+                }).detach();
 
                 break;
             }
@@ -295,6 +301,8 @@ public:
         if(triggered_cs.load() || in_cs.load() || is_send_end()) return;
         queue_mtx.lock();
 
+        start_trigger = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+
         triggered_cs.store(true);
         RN[PROCESS_ID]++;
 
@@ -311,7 +319,7 @@ public:
 
     void local_computation() {
         if(triggered_cs.load() || in_cs.load()) return;
-        usleep((*internal_distribution)(generator)*4000000); // simulation some process.
+        usleep((*internal_distribution)(generator)*3000000); // simulation some process.
         auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         printf("[%ld] Process %d executes internal event\n", timestamp, PROCESS_ID);
         fflush(stdout);
@@ -320,6 +328,8 @@ public:
     void cs_computation() {
         auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         printf("[%ld] Process %d starts critical section\n", timestamp, PROCESS_ID);
+        fflush(stdout);
+        total_response_time += (timestamp - start_trigger);
         num_cs_entry++;
         assert(has_token.load());
         usleep((*cs_distribution)(generator)*2000000); // simulation some process.
@@ -366,9 +376,13 @@ public:
 
     // A single message send event.
     void send_packet(packet p, int to) {
+        if(p.type != TERMINATE) {
+            total_control_msg++;
+        }
         auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         printf("[%ld] sending %s: %d -> %d\n", timestamp, p.type_string().c_str(), PROCESS_ID, to);
         fflush(stdout);
+        assert(to >= 0 && to < TOTAL_PROCS);
         if(MPI_Isend(send_vector, p.marshal(send_vector), MPI_BYTE, to, 0, MPI_COMM_WORLD, &request) == 0) {
         } else {
             printf("### SEND ERROR\n"); fflush(stdout);
@@ -425,7 +439,8 @@ int main(int argc, const char* argv[]) {
     recv_thread.join();
 
     auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-    printf("[%ld] Ending Process %d\n", timestamp, PROCESS_ID);
+    printf("[%ld] Ending Process %d {total_control_msg=%d, total_response_time=%ld, count=%d}\n", 
+            timestamp, PROCESS_ID, p.total_control_msg.load(), p.total_response_time, p.num_cs_entry.load());
     fflush(stdout);
 
 
