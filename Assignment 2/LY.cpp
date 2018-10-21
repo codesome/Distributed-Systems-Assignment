@@ -15,7 +15,6 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <mpi.h>
-#include "channel.h"
 #include "common.h"
 using namespace std;
 
@@ -154,10 +153,6 @@ public:
     // Lock to be acquired while sending messages.
     mutex send_mtx;
 
-    // A thread safe - go style channel to pass messages 
-    // for processing from receive event. 
-    Channel<buffer_message> recv_buffer;
-
     // The current process's snapshot.
     snapshot my_snapshot;
 
@@ -193,7 +188,6 @@ public:
     void end_proc() {
         if(!end.load()) {
             end.store(true);
-            recv_buffer.close();
             snap_dump << "===============================================================================\n";
             snap_dump.close();
         }
@@ -373,148 +367,129 @@ public:
         MESSAGE_TYPE type = MESSAGE_TYPE(*((char*)recv_vector));
         if(type != TERMINATE || !root()) {
             // If it a terminate, we only process it if it's not a root.
-            void *cpy = malloc(size);
-            memcpy(cpy, recv_vector, size);
-            // Add the packet into the buffer which will be processed by another thread.
-            recv_buffer.add(buffer_message(cpy, size));
+            process_messages(size);
         }
 
         return type != TERMINATE;
     };
 
-    void process_messages() {
-        bool is_closed;
-        while(true && !end.load()) {
-            buffer_message msg = recv_buffer.retrieve(&is_closed);
-            if(is_closed) {
-                return;
-            }
+    void process_messages(int size) {
+        void *data = recv_vector;
 
-            void *data = msg.data;
-
-            MESSAGE_TYPE type = MESSAGE_TYPE(read_char(&data));
-            auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-            switch(type) {
-                // DATA
-                case DATA: {
-                    message m;
-                    m.unmarshal(data);
-                    total_amount += m.amount;
-                    total_amount_recv += m.amount;
-                    printf("[%ld] (%d) AMOUNT RECEIVED (%d <- %d): %d\n", timestamp, m.id, PROCESS_ID, m.from, m.amount);
-                    fflush(stdout);
-                    if(m.color == WHITE) {
-                        my_snapshot.rcvd_msgs[m.from].push_back(m);
-                    }
-                    break;
-                } // DATA
-                // CONTROL
-                case CONTROL: {
-                    total_control_msg_rcvd++;
-                    CONTROL_TYPE ctype = CONTROL_TYPE(read_char(&data));
-                    int from = read_int(&data);
-                    switch(ctype) {
-                        // CONTROL, MARKER
-                        case MARKER: {
-                            printf("[%ld] %d received MARKER from %d\n", timestamp, PROCESS_ID, from);
-                            fflush(stdout);
-                            if(color==WHITE) {
-                                trigger_snapshot();
+        MESSAGE_TYPE type = MESSAGE_TYPE(read_char(&data));
+        auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+        switch(type) {
+            // DATA
+            case DATA: {
+                message m;
+                m.unmarshal(data);
+                total_amount += m.amount;
+                total_amount_recv += m.amount;
+                printf("[%ld] (%d) AMOUNT RECEIVED (%d <- %d): %d\n", timestamp, m.id, PROCESS_ID, m.from, m.amount);
+                fflush(stdout);
+                if(m.color == WHITE) {
+                    my_snapshot.rcvd_msgs[m.from].push_back(m);
+                }
+                break;
+            } // DATA
+            // CONTROL
+            case CONTROL: {
+                total_control_msg_rcvd++;
+                CONTROL_TYPE ctype = CONTROL_TYPE(read_char(&data));
+                int from = read_int(&data);
+                switch(ctype) {
+                    // CONTROL, MARKER
+                    case MARKER: {
+                        printf("[%ld] %d received MARKER from %d\n", timestamp, PROCESS_ID, from);
+                        fflush(stdout);
+                        if(color==WHITE) {
+                            trigger_snapshot();
+                        }
+                        marker_received[from] = true;
+                        
+                        send_mtx.lock();
+                        printf("[%ld] SNAPSHOT DONE: %d\n", timestamp, PROCESS_ID);
+                        fflush(stdout);
+                        if(root()) {
+                            if(!snapshot_received[PROCESS_ID]) {
+                                all_snapshots.push_back(my_snapshot);
+                                snapshot_received[PROCESS_ID] = true;
                             }
-                            marker_received[from] = true;
-                            
-                            send_mtx.lock();
-                            printf("[%ld] SNAPSHOT DONE: %d\n", timestamp, PROCESS_ID);
-                            fflush(stdout);
-                            if(root()) {
-                                if(!snapshot_received[PROCESS_ID]) {
-                                    all_snapshots.push_back(my_snapshot);
-                                    snapshot_received[PROCESS_ID] = true;
-                                }
-                                color = WHITE;
-                                if(all_snapshots_received()) {
-                                    in_a_snapshot = false;
-                                    root_termination_check();
-                                }
-                                send_mtx.unlock();
-                                break;
-                            }
-
-                            void *cpy = send_vector;
-                            cpy = write_char(cpy, CONTROL);
-                            cpy = write_char(cpy, SNAPSHOT);
-                            cpy = write_int(cpy, PROCESS_ID);
-                            int size = my_snapshot.marshal(cpy) + (2*sizeof(char)) + sizeof(int);
-
-                            my_snapshot.print();
-                            timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-                            if(MPI_Isend(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
-                                printf("[%ld] SNAPSHOT SENT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
-                                fflush(stdout);
-                            } else {
-                                printf("### SEND ERROR\n"); fflush(stdout);
-                            }
-
                             color = WHITE;
-                            send_mtx.unlock();
-                            break;
-                        } // MARKER
-                        // CONTROL, SNAPSHOT
-                        case SNAPSHOT: {
-                            printf("[%ld] Process %d got snapshot from %d\n", timestamp, PROCESS_ID, from);
-                            fflush(stdout);
-                            if(root()) {
-                                snapshot s;
-                                s.unmarshal(data);
-                                all_snapshots.push_back(s);
-                                snapshot_received[s.pid] = true;
-
-                                if(all_snapshots_received()) {
-                                    in_a_snapshot = false;
-                                    root_termination_check();
-                                }
-
-                                break;
-                            }
-                            send_mtx.lock();
-                            timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-                            if(MPI_Isend(msg.data, msg.size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
-                                printf("[%ld] FORWARD SNAPSHOT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
-                                fflush(stdout);
-                            } else {
-                                printf("### SEND ERROR\n"); fflush(stdout);
+                            if(all_snapshots_received()) {
+                                in_a_snapshot = false;
+                                root_termination_check();
                             }
                             send_mtx.unlock();
                             break;
-                        } // SNAPSHOT
-                        default:
-                            printf("Unknown control message type (process=%d): %d\n", PROCESS_ID, type);
-                            fflush(stdout);
-                    }
-                    break;
-                } // CONTROL
-                // TERMINATE
-                case TERMINATE: {
-                    printf("[%ld] TERMINATE: %d\n", timestamp, PROCESS_ID);
-                    fflush(stdout);
-                    send_all_terminations();
-                    end_proc();
-                    break;
-                } // TERMINATE
-                default:
-                    printf("Unknown message type (process=%d): %d\n", PROCESS_ID, type);
-                    fflush(stdout);
-            }
+                        }
 
-            free(msg.data);
+                        void *cpy = send_vector;
+                        cpy = write_char(cpy, CONTROL);
+                        cpy = write_char(cpy, SNAPSHOT);
+                        cpy = write_int(cpy, PROCESS_ID);
+                        int size = my_snapshot.marshal(cpy) + (2*sizeof(char)) + sizeof(int);
+
+                        my_snapshot.print();
+                        timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+                        if(MPI_Isend(send_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
+                            printf("[%ld] SNAPSHOT SENT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
+                            fflush(stdout);
+                        } else {
+                            printf("### SEND ERROR\n"); fflush(stdout);
+                        }
+
+                        color = WHITE;
+                        send_mtx.unlock();
+                        break;
+                    } // MARKER
+                    // CONTROL, SNAPSHOT
+                    case SNAPSHOT: {
+                        printf("[%ld] Process %d got snapshot from %d\n", timestamp, PROCESS_ID, from);
+                        fflush(stdout);
+                        if(root()) {
+                            snapshot s;
+                            s.unmarshal(data);
+                            all_snapshots.push_back(s);
+                            snapshot_received[s.pid] = true;
+
+                            if(all_snapshots_received()) {
+                                in_a_snapshot = false;
+                                root_termination_check();
+                            }
+
+                            break;
+                        }
+                        send_mtx.lock();
+                        timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+                        if(MPI_Isend(recv_vector, size, MPI_BYTE, to_send_snapshot, 0, MPI_COMM_WORLD, &request) == 0) {
+                            printf("[%ld] FORWARD SNAPSHOT: %d -> %d\n", timestamp, PROCESS_ID, to_send_snapshot);
+                            fflush(stdout);
+                        } else {
+                            printf("### SEND ERROR\n"); fflush(stdout);
+                        }
+                        send_mtx.unlock();
+                        break;
+                    } // SNAPSHOT
+                    default:
+                        printf("Unknown control message type (process=%d): %d\n", PROCESS_ID, type);
+                        fflush(stdout);
+                }
+                break;
+            } // CONTROL
+            // TERMINATE
+            case TERMINATE: {
+                printf("[%ld] TERMINATE: %d\n", timestamp, PROCESS_ID);
+                fflush(stdout);
+                send_all_terminations();
+                end_proc();
+                break;
+            } // TERMINATE
+            default:
+                printf("Unknown message type (process=%d): %d\n", PROCESS_ID, type);
+                fflush(stdout);
         }
-        while(!is_closed) {
-            buffer_message msg = recv_buffer.retrieve(&is_closed);
-            if(is_closed) {
-                return;
-            }
-            free(msg.data);
-        }
+
     }
 
     // Internal event.
@@ -637,11 +612,6 @@ int main(int argc, const char* argv[]) {
         }
     }, &p);
 
-    // Processing messages thread.
-    thread process_msg_thread([](process *p){
-        p->process_messages();
-    }, &p);
-
     // Thread to trigger snapshots.
     thread snapshot_trigger_thread([](process *p){
         if(!p->root()) {
@@ -663,7 +633,6 @@ int main(int argc, const char* argv[]) {
     sleep(3);
     p.end_proc();
 
-    process_msg_thread.join();
     snapshot_trigger_thread.join();
     recv_thread.join();
 
