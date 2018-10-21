@@ -3,6 +3,7 @@
 **/
 
 #include <thread>
+#include <deque>
 #include <atomic>
 #include <algorithm>
 #include <vector>
@@ -31,9 +32,63 @@ exponential_distribution<double> *cs_distribution, *internal_distribution;
 // dummy, just to satisfy function argument.
 MPI_Request request; 
 
+struct token {
+    vector<int> LN;
+    deque<int> Q;
+
+
+    int marshal(void *original) {
+        void *ptr = original;
+
+        int total_size = 0;
+
+        ptr = write_int(ptr, LN.size());
+        total_size += sizeof(int);
+        for(auto v: LN) {
+            ptr = write_int(ptr, v);
+        }
+        total_size += LN.size()*sizeof(int);
+        
+        ptr = write_int(ptr, Q.size());
+        total_size += sizeof(int);
+        for(auto v: Q) {
+            ptr = write_int(ptr, v);
+        }
+        total_size += Q.size()*sizeof(int);
+
+        return total_size;
+    }
+    void unmarshal(void *original) {
+        void *ptr = original;
+
+        int size = read_int(&ptr);
+        assert(size == TOTAL_PROCS);
+        LN.clear();
+        for(int i=0; i<size; i++) {
+            int val = read_int(&ptr);
+            LN.push_back(val);
+        }
+
+        size = read_int(&ptr);
+        Q.clear();
+        for(int i=0; i<size; i++) {
+            int val = read_int(&ptr);
+            Q.push_back(val);
+        }
+    }
+};
+
 struct packet {
     PACKET_TYPE type;
     int from;
+
+    // REQUEST
+    int sn;
+
+    // TOKEN
+    token tkn;
+    vector<int> LN;
+    deque<int> Q;
 
     packet() {}
 
@@ -56,12 +111,27 @@ struct packet {
         void *ptr = original;
         ptr = write_char(ptr, type);
         ptr = write_int(ptr, from);
-        return sizeof(char) + sizeof(int);
+
+        int total_size = sizeof(char) + sizeof(int);
+
+        if(type == REQUEST) {
+            ptr = write_int(ptr, sn);
+            total_size += sizeof(int);
+        } else if(type == TOKEN) {
+            total_size += tkn.marshal(ptr);
+        }
+        return total_size;
     }
     void unmarshal(void *original) {
         void *ptr = original;
         type = PACKET_TYPE(read_char(&ptr));
         from = read_int(&ptr);
+
+        if(type == REQUEST) {
+            sn = read_int(&ptr);
+        } else if(type == TOKEN) {
+            tkn.unmarshal(ptr);
+        }
     }
 };
 
@@ -73,42 +143,39 @@ public:
                 in_cs,
                 triggered_cs;
 
-    int token_holder;
     atomic_int num_cs_entry;
     
     mutex queue_mtx;
-    queue<int> req_queue;
+    vector<int> RN;
 
     void *recv_vector, *send_vector;
 
     bool *ended;
 
+    token tkn;
+
     process():
         has_token(false),
         in_cs(false),
         triggered_cs(false),
-        num_cs_entry(0) {}
-
-    process(int token_holder):
-        has_token(false),
-        in_cs(false),
-        triggered_cs(false),
-        num_cs_entry(0),
-
-        token_holder(token_holder)
+        num_cs_entry(0)
     {
         recv_vector = malloc(max_packet_size);
         send_vector = malloc(max_packet_size);
 
         ended = new bool[TOTAL_PROCS];
+        RN.resize(TOTAL_PROCS);
         for(int i=0; i<TOTAL_PROCS; i++) {
             ended[i] = false;
+            RN[i] = 0;
         }
 
-        if(token_holder == PROCESS_ID) {
-            auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
-            printf("[%ld] %d has token\n", timestamp, PROCESS_ID); fflush(stdout);
+        if(PROCESS_ID == 0) {
             has_token.store(true);
+            tkn.LN.resize(TOTAL_PROCS);
+            for(int i=0; i<TOTAL_PROCS; i++) {
+                tkn.LN[i] = 0;
+            }
         }
     }
 
@@ -128,11 +195,29 @@ public:
 
     void send_terminate_to_all() {
         packet p(TERMINATE, PROCESS_ID);
+        send_to_all(p);
+        ended[PROCESS_ID] = true;
+    }
+
+    void send_request_to_all() {
+        packet p(REQUEST, PROCESS_ID);
+        p.sn = RN[PROCESS_ID];
+        send_to_all(p);
+    }
+
+    void send_to_all(packet p) {
         for(int i=0; i<TOTAL_PROCS; i++) {
             if(i == PROCESS_ID) continue;
             send_packet(p, i);
         }
-        ended[PROCESS_ID] = true;
+    }
+
+    void send_token(int to) {
+        assert(has_token.load());
+        packet p(TOKEN, PROCESS_ID);
+        p.tkn = tkn;
+        send_packet(p, to);
+        has_token.store(false);
     }
 
     // A single message receive event.
@@ -165,57 +250,39 @@ public:
                 printf("[%ld] Process %d received REQUEST from %d\n", timestamp, PROCESS_ID, p.from);
                 fflush(stdout);
 
-                req_queue.emplace(p.from);
+                RN[p.from] = p.sn > RN[p.from] ? p.sn: RN[p.from];
 
-                if(req_queue.front() == p.from && has_token.load() && !in_cs.load()) {
-                    req_queue.pop();
-                    packet tkn(TOKEN, PROCESS_ID);
-                    send_packet(tkn, p.from);
-                    has_token.store(false);
-                    token_holder = p.from;
-                } else if(!has_token.load() && req_queue.size()==1) {
-                    request_token();
+                if(has_token.load() && (RN[p.from]==tkn.LN[p.from]+1) && !triggered_cs.load() && !in_cs.load()) {
+                    send_token(p.from);
                 }
 
                 queue_mtx.unlock();
                 break;
             }
             case TOKEN: {
+
                 queue_mtx.lock();
 
                 auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
                 printf("[%ld] Process %d received TOKEN from %d\n", timestamp, PROCESS_ID, p.from);
                 fflush(stdout);
-                
-                has_token.store(true);
-                token_holder = PROCESS_ID;
-                int cs_winner = req_queue.front();
-                req_queue.pop();
 
-                if(cs_winner == PROCESS_ID) {
-                    in_cs.store(true);
-                    queue_mtx.unlock();
-                    cs_computation();
-                } else {
-                    packet tkn(TOKEN, PROCESS_ID);
-                    send_packet(tkn, cs_winner);
-                    has_token.store(false);
-                    token_holder = cs_winner;
-                    if(req_queue.size() > 0) {
-                        tkn.type = REQUEST;
-                        send_packet(tkn, token_holder);
-                    }
-                    queue_mtx.unlock();
-                }
+                has_token.store(true);
+                tkn = p.tkn;
+
+                in_cs.store(true);
+                queue_mtx.unlock();
+
+                cs_computation();
 
                 break;
             }
             case TERMINATE: {
+                ended[p.from] = true;
+
                 auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
                 printf("[%ld] Process %d received TERMINATE from %d\n", timestamp, PROCESS_ID, p.from);
                 fflush(stdout);
-
-                ended[p.from] = true;
             }
             default: {
                 break;
@@ -229,25 +296,17 @@ public:
         queue_mtx.lock();
 
         triggered_cs.store(true);
-        req_queue.emplace(PROCESS_ID);
+        RN[PROCESS_ID]++;
 
-        if(req_queue.front() == PROCESS_ID && has_token.load()) {
-            req_queue.pop();
+        if(has_token.load()) {
             in_cs.store(true);
             queue_mtx.unlock();
             cs_computation();
             return;
         }
         
-        if(!has_token.load() && req_queue.size()==1) {
-            request_token();
-        }
+        send_request_to_all();
         queue_mtx.unlock();
-    }
-
-    void request_token() {
-        packet p(REQUEST, PROCESS_ID);
-        send_packet(p, token_holder);
     }
 
     void local_computation() {
@@ -261,13 +320,12 @@ public:
     void cs_computation() {
         auto timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         printf("[%ld] Process %d starts critical section\n", timestamp, PROCESS_ID);
-        fflush(stdout);
         num_cs_entry++;
         assert(has_token.load());
         usleep((*cs_distribution)(generator)*2000000); // simulation some process.
+        fflush(stdout);
         timestamp = chrono::duration_cast<std::chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
         printf("[%ld] Process %d ends critical section\n", timestamp, PROCESS_ID);
-        fflush(stdout);
         cs_leaving_task();
     };
 
@@ -278,20 +336,29 @@ public:
         triggered_cs.store(false);
         
         assert(has_token.load());
-        assert(token_holder == PROCESS_ID);
-        if(req_queue.size() > 0) {
-            int cs_winner = req_queue.front();
-            req_queue.pop();
-            assert(cs_winner != PROCESS_ID);
+        
+        tkn.LN[PROCESS_ID] = RN[PROCESS_ID];
 
-            packet tkn(TOKEN, PROCESS_ID);
-            send_packet(tkn, cs_winner);
-            has_token.store(false);
-            token_holder = cs_winner;
-            if(req_queue.size() > 0) {
-                tkn.type = REQUEST;
-                send_packet(tkn, token_holder);
+        // Adding remaining processess into the queue.
+        for(int i=0; i<TOTAL_PROCS; i++) {
+            if(RN[i] == tkn.LN[i]+1) {
+                bool present = false;
+                for(auto v: tkn.Q) {
+                    if(v == i) {
+                        present = true;
+                        break;
+                    }
+                }
+                if(!present) {
+                    tkn.Q.push_back(i);
+                }
             }
+        }
+
+        if(tkn.Q.size() > 0) {
+            int to = tkn.Q[0];
+            tkn.Q.pop_front();
+            send_token(to);
         }
 
         queue_mtx.unlock();
@@ -335,15 +402,7 @@ int main(int argc, const char* argv[]) {
 	internal_distribution = new exponential_distribution<double>(alpha);
 	cs_distribution = new exponential_distribution<double>(beta);
 
-    int token_holder = 0;
-    for(int i=0; i<n; i++) {
-        inFile >> token_holder;
-        if(i == PROCESS_ID) {
-            break;
-        }
-    }
-
-    process p(token_holder);
+    process p;
 
 
     // Receiving messages thread.

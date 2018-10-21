@@ -7,6 +7,10 @@
 
 const int max_packet_size = 65536;
 
+enum PACKET_TYPE : char {
+    REQUEST = 0, TOKEN = 1, TERMINATE = 2
+};
+
 // Functions to read and write int and char to void* buffer.
 
 void increment(void **ptr, int offset) {
