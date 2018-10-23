@@ -6,10 +6,10 @@ N=10
 all: build_Raymond build_SuzukiKasami
 
 build_Raymond:
-	$(CXX) Raymond.cpp -o Raymond.out -lpthread
+	$(CXX) ProgAssn3-CS15BTECH11018-Raymond.cpp -o Raymond.out -lpthread
 
 build_SuzukiKasami:
-	$(CXX) SuzukiKasami.cpp -o SuzukiKasami.out -lpthread
+	$(CXX) ProgAssn3-CS15BTECH11018-SuzukiKasami.cpp -o SuzukiKasami.out -lpthread
 
 # Run
 run_Raymond:

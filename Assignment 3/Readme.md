@@ -1,4 +1,4 @@
-# Distributed Mutex: Raymond
+# Distributed Mutex
 
 ## Prerequisites
 
@@ -50,8 +50,12 @@ To sort the logs based on timestamp in the file *after running*, run the followi
 ```
 # Sorts Raymond_logs.txt
 $ make sort_raymond_logs
+
 # Sorts SuzukiKasami_logs.txt
 $ make sort_suzuki_kasami_logs
+
+# To sort both the logs
+$ make sort_logs
 ```
 
 ## Example 1
@@ -60,6 +64,7 @@ $ make sort_suzuki_kasami_logs
 $ make gen_input N=6
 $ make Raymond N=6
 $ make SuzukiKasami N=6
+$ make sort_logs
 ```
 
 ## Example 2
@@ -68,4 +73,5 @@ $ make SuzukiKasami N=6
 $ cp inp9 inp-params.txt
 $ make Raymond N=9
 $ make SuzukiKasami N=9
+$ make sort_logs
 ```
