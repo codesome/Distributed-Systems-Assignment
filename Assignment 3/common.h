@@ -7,6 +7,7 @@
 
 const int max_packet_size = 65536;
 
+// Types of packets sent. Used inside the packet.
 enum PACKET_TYPE : char {
     REQUEST = 0, TOKEN = 1, TERMINATE = 2
 };
